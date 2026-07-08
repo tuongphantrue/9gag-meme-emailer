@@ -13,10 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -28,4 +28,6 @@ jobs:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           MEME_RECIPIENT: ${{ secrets.MEME_RECIPIENT }}
+          VOTE_THRESHOLD: "5000"   # only send memes with more than this many upvotes
+          MAX_MEMES: "20"          # cap on attachments per email
         run: python 9gag_top_meme_emailer.py
