@@ -2,8 +2,9 @@
 """
 9gag Top Memes of the Day -> Email
 
-Fetches posts from 9gag's "hot" feed with more than VOTE_THRESHOLD upvotes
-and emails them all as attachments in a single email via Gmail.
+Fetches posts from 9gag's "hot" feed, ranks them by upvote count, and emails
+the top MAX_MEMES of them (default 30) as attachments in a single email via
+Gmail.
 
 SETUP
 -----
@@ -19,8 +20,7 @@ SETUP
        export GMAIL_ADDRESS="youraddress@gmail.com"
        export GMAIL_APP_PASSWORD="16-char-app-password"
        export MEME_RECIPIENT="where-to-send@example.com"
-       export VOTE_THRESHOLD="5000"      # optional, defaults to 5000
-       export MAX_MEMES="20"             # optional, cap on attachments per email
+       export MAX_MEMES="30"             # optional, how many top memes to send
 
 4. Run it:
        python 9gag_top_meme_emailer.py
@@ -36,7 +36,6 @@ import smtplib
 import ssl
 import sys
 from email.message import EmailMessage
-from urllib.parse import urlencode
 
 import requests
 
@@ -52,10 +51,13 @@ HEADERS = {
     "Referer": "https://9gag.com/hot",
 }
 
-MAX_PAGES = 10  # safety cap on how many feed pages to walk while searching
+# How many feed pages to scan when building the candidate pool. The hot feed
+# is ranked by a "hot score" (not pure vote count), so we gather a decent
+# pool of candidates before picking the highest-voted ones out of it.
+CANDIDATE_PAGES = 15
 
 
-def fetch_hot_pages(max_pages=MAX_PAGES):
+def fetch_hot_pages(max_pages=CANDIDATE_PAGES):
     """Yield successive pages of the hot feed's post list."""
     next_cursor = None
     for _ in range(max_pages):
@@ -79,14 +81,12 @@ def fetch_hot_pages(max_pages=MAX_PAGES):
             break
 
 
-def get_top_memes(vote_threshold, max_memes):
-    """Return a list of (title, votes, image_bytes, filename) above vote_threshold."""
-    matches = []
+def collect_candidates():
+    """Gather SFW image/gif post metadata (no image download yet) from the hot feed."""
+    candidates = []
     seen_ids = set()
 
     for posts in fetch_hot_pages():
-        page_had_qualifying_post = False
-
         for post in posts:
             post_id = post.get("id")
             if post_id in seen_ids:
@@ -98,34 +98,44 @@ def get_top_memes(vote_threshold, max_memes):
             if post.get("type") not in ("Photo", "Animated"):
                 continue
 
-            votes = post.get("upVoteCount", 0)
-            if votes <= vote_threshold:
-                continue
+            candidates.append({
+                "id": post_id,
+                "title": post.get("title", "Untitled meme"),
+                "votes": post.get("upVoteCount", 0),
+                "image_url": post["images"]["image700"]["url"],
+            })
 
-            page_had_qualifying_post = True
-            title = post.get("title", "Untitled meme")
-            image_url = post["images"]["image700"]["url"]
+    return candidates
 
-            img_resp = requests.get(image_url, headers=HEADERS, timeout=15)
-            img_resp.raise_for_status()
 
-            ext = image_url.split(".")[-1].split("?")[0]
-            safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title)[:50].strip()
-            filename = f"{votes}_{safe_title or post_id}.{ext}"
+def download_meme(candidate):
+    """Download the image for a candidate and return (title, votes, image_bytes, filename)."""
+    img_resp = requests.get(candidate["image_url"], headers=HEADERS, timeout=15)
+    img_resp.raise_for_status()
 
-            matches.append((title, votes, img_resp.content, filename))
-            print(f"  matched: {title} ({votes} upvotes)")
+    ext = candidate["image_url"].split(".")[-1].split("?")[0]
+    safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in candidate["title"])[:50].strip()
+    filename = f"{candidate['votes']}_{safe_title or candidate['id']}.{ext}"
 
-            if len(matches) >= max_memes:
-                return matches
+    return candidate["title"], candidate["votes"], img_resp.content, filename
 
-        # Since the hot feed is ranked by score (not strictly by vote count),
-        # stop paging once a whole page had no posts above the threshold —
-        # further pages are unlikely to have anything higher.
-        if not page_had_qualifying_post:
-            break
 
-    return matches
+def get_top_memes(max_memes):
+    """Return the top `max_memes` hot posts, ranked by upvote count."""
+    candidates = collect_candidates()
+    if not candidates:
+        return []
+
+    candidates.sort(key=lambda c: c["votes"], reverse=True)
+    top_candidates = candidates[:max_memes]
+
+    memes = []
+    for candidate in top_candidates:
+        meme = download_meme(candidate)
+        memes.append(meme)
+        print(f"  included: {meme[0]} ({meme[1]} upvotes)")
+
+    return memes
 
 
 def send_email(subject, body, attachments, sender, app_password, recipient):
@@ -151,8 +161,7 @@ def main():
     sender = os.environ.get("GMAIL_ADDRESS")
     app_password = os.environ.get("GMAIL_APP_PASSWORD")
     recipient = os.environ.get("MEME_RECIPIENT")
-    vote_threshold = int(os.environ.get("VOTE_THRESHOLD", "5000"))
-    max_memes = int(os.environ.get("MAX_MEMES", "20"))
+    max_memes = int(os.environ.get("MAX_MEMES", "30"))
 
     missing = [name for name, val in [
         ("GMAIL_ADDRESS", sender),
@@ -163,22 +172,22 @@ def main():
         print(f"Missing required environment variables: {', '.join(missing)}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Fetching hot memes with more than {vote_threshold} upvotes...")
-    memes = get_top_memes(vote_threshold, max_memes)
+    print(f"Fetching top {max_memes} hot memes by upvotes...")
+    memes = get_top_memes(max_memes)
 
     if not memes:
-        print(f"No memes found above {vote_threshold} upvotes today — not sending an email.")
+        print("No memes found — not sending an email.")
         return
 
     print(f"Found {len(memes)} meme(s). Emailing to {recipient}...")
 
-    lines = [f"Today's top memes from 9gag (more than {vote_threshold} upvotes):", ""]
+    lines = [f"Today's top {len(memes)} memes from 9gag, ranked by upvotes:", ""]
     for title, votes, _, _ in memes:
         lines.append(f"- {title} ({votes} upvotes)")
     body = "\n".join(lines)
 
     send_email(
-        subject=f"Top memes of the day: {len(memes)} posts over {vote_threshold} upvotes",
+        subject=f"Top {len(memes)} memes of the day",
         body=body,
         attachments=memes,
         sender=sender,
