@@ -29,4 +29,5 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           MEME_RECIPIENT: ${{ secrets.MEME_RECIPIENT }}
           MAX_MEMES: "30"          # how many top-voted memes to include per email
+          GRID_COLUMNS: "3"        # cards per row in the HTML digest
         run: python 9gag_top_meme_emailer.py
