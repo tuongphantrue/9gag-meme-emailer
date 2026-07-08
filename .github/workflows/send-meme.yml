@@ -28,6 +28,5 @@ jobs:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           MEME_RECIPIENT: ${{ secrets.MEME_RECIPIENT }}
-          VOTE_THRESHOLD: "5000"   # only send memes with more than this many upvotes
-          MAX_MEMES: "20"          # cap on attachments per email
+          MAX_MEMES: "30"          # how many top-voted memes to include per email
         run: python 9gag_top_meme_emailer.py
