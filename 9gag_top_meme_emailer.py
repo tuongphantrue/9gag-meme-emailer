@@ -23,6 +23,7 @@ SETUP
        export MEME_RECIPIENT="where-to-send@example.com"
        export MAX_MEMES="30"      # optional, how many top memes to send
        export GRID_COLUMNS="3"    # optional, cards per row in the email
+       export TIMEZONE="Asia/Ho_Chi_Minh"  # optional, used for the subject line's date/time
 
 4. Run it:
        python 9gag_top_meme_emailer.py
@@ -37,6 +38,7 @@ import os
 import smtplib
 import ssl
 import sys
+from datetime import datetime
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -261,8 +263,17 @@ def main():
         return
 
     print(f"Found {len(memes)} meme(s). Emailing to {recipient}...")
+
+    timezone_name = os.environ.get("TIMEZONE", "Asia/Ho_Chi_Minh")
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo(timezone_name))
+    except Exception:
+        now = datetime.now()
+    timestamp = now.strftime("%b %d, %Y %I:%M %p")
+
     send_email(
-        subject=f"Top {len(memes)} memes of the day",
+        subject=f"Top {len(memes)} memes of the day - {timestamp}",
         memes=memes,
         columns=columns,
         sender=sender,
