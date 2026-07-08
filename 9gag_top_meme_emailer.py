@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-9gag Top Meme of the Day -> Email
+9gag Top Memes of the Day -> Email
 
-Fetches the current #1 post from 9gag's "hot" feed and emails it as an
-image attachment via Gmail.
+Fetches posts from 9gag's "hot" feed with more than VOTE_THRESHOLD upvotes
+and emails them all as attachments in a single email via Gmail.
 
 SETUP
 -----
@@ -19,24 +19,16 @@ SETUP
        export GMAIL_ADDRESS="youraddress@gmail.com"
        export GMAIL_APP_PASSWORD="16-char-app-password"
        export MEME_RECIPIENT="where-to-send@example.com"
-
-   (On Windows, use `setx` or set them in Task Scheduler's action instead.)
+       export VOTE_THRESHOLD="5000"      # optional, defaults to 5000
+       export MAX_MEMES="20"             # optional, cap on attachments per email
 
 4. Run it:
        python 9gag_top_meme_emailer.py
 
 SCHEDULING
 ----------
-- macOS/Linux: add a cron entry, e.g. run every day at 9am:
-      0 9 * * * /usr/bin/python3 /path/to/9gag_top_meme_emailer.py >> /path/to/log.txt 2>&1
-  Edit with: crontab -e
-
-- Windows: use Task Scheduler to run this script daily
-  (Action = "Start a program", Program = python.exe, Arguments = path to this script).
-
-- No always-on computer: use a free scheduler like GitHub Actions (a scheduled
-  workflow) or cron-job.org hitting a small hosted version of this script.
-  Ask me and I can set up whichever option you pick.
+See README.md / GitHub Actions workflow in this repo for running this daily
+in the cloud without needing your own computer on.
 """
 
 import os
@@ -44,6 +36,7 @@ import smtplib
 import ssl
 import sys
 from email.message import EmailMessage
+from urllib.parse import urlencode
 
 import requests
 
@@ -52,65 +45,101 @@ import requests
 # main 9gag group, "hot" is the section (hot/fresh/trending).
 NINEGAG_HOT_URL = "https://9gag.com/v1/group-posts/group/default/type/hot"
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://9gag.com/hot",
+}
 
-def get_top_meme():
-    """Return (title, image_bytes, filename) for today's #1 hot post."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://9gag.com/hot",
-    }
-    resp = requests.get(NINEGAG_HOT_URL, headers=headers, timeout=15)
-    if resp.status_code != 200:
-        # Surface the response body — 9gag's error messages are useful for debugging.
-        print(f"9gag API returned {resp.status_code}: {resp.text[:500]}", file=sys.stderr)
-    resp.raise_for_status()
-    data = resp.json()
-
-    posts = data.get("data", {}).get("posts", [])
-    if not posts:
-        raise RuntimeError("No posts returned from 9gag API")
-
-    # Posts are already ranked by "hot" score; posts[0] is the top one.
-    # Skip any NSFW or video-only posts, take the first clean image post.
-    top_post = None
-    for post in posts:
-        if post.get("nsfw", 0):
-            continue
-        if post.get("type") not in ("Photo", "Animated"):
-            continue
-        top_post = post
-        break
-
-    if top_post is None:
-        raise RuntimeError("No suitable (SFW image) post found in hot feed")
-
-    title = top_post.get("title", "Untitled meme")
-    image_url = top_post["images"]["image700"]["url"]
-
-    img_resp = requests.get(image_url, headers=headers, timeout=15)
-    img_resp.raise_for_status()
-
-    ext = image_url.split(".")[-1].split("?")[0]
-    filename = f"top_meme_of_the_day.{ext}"
-
-    return title, img_resp.content, filename
+MAX_PAGES = 10  # safety cap on how many feed pages to walk while searching
 
 
-def send_email(subject, body, image_bytes, filename, sender, app_password, recipient):
+def fetch_hot_pages(max_pages=MAX_PAGES):
+    """Yield successive pages of the hot feed's post list."""
+    next_cursor = None
+    for _ in range(max_pages):
+        url = NINEGAG_HOT_URL
+        if next_cursor:
+            url = f"{NINEGAG_HOT_URL}?{next_cursor}"
+
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            print(f"9gag API returned {resp.status_code}: {resp.text[:500]}", file=sys.stderr)
+        resp.raise_for_status()
+        data = resp.json().get("data", {})
+
+        posts = data.get("posts", [])
+        if not posts:
+            break
+        yield posts
+
+        next_cursor = data.get("nextCursor")
+        if not next_cursor:
+            break
+
+
+def get_top_memes(vote_threshold, max_memes):
+    """Return a list of (title, votes, image_bytes, filename) above vote_threshold."""
+    matches = []
+    seen_ids = set()
+
+    for posts in fetch_hot_pages():
+        page_had_qualifying_post = False
+
+        for post in posts:
+            post_id = post.get("id")
+            if post_id in seen_ids:
+                continue
+            seen_ids.add(post_id)
+
+            if post.get("nsfw", 0):
+                continue
+            if post.get("type") not in ("Photo", "Animated"):
+                continue
+
+            votes = post.get("upVoteCount", 0)
+            if votes <= vote_threshold:
+                continue
+
+            page_had_qualifying_post = True
+            title = post.get("title", "Untitled meme")
+            image_url = post["images"]["image700"]["url"]
+
+            img_resp = requests.get(image_url, headers=HEADERS, timeout=15)
+            img_resp.raise_for_status()
+
+            ext = image_url.split(".")[-1].split("?")[0]
+            safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in title)[:50].strip()
+            filename = f"{votes}_{safe_title or post_id}.{ext}"
+
+            matches.append((title, votes, img_resp.content, filename))
+            print(f"  matched: {title} ({votes} upvotes)")
+
+            if len(matches) >= max_memes:
+                return matches
+
+        # Since the hot feed is ranked by score (not strictly by vote count),
+        # stop paging once a whole page had no posts above the threshold —
+        # further pages are unlikely to have anything higher.
+        if not page_had_qualifying_post:
+            break
+
+    return matches
+
+
+def send_email(subject, body, attachments, sender, app_password, recipient):
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = recipient
     msg.set_content(body)
 
-    maintype = "image"
-    subtype = filename.split(".")[-1]
-    if subtype == "jpg":
-        subtype = "jpeg"
-
-    msg.add_attachment(image_bytes, maintype=maintype, subtype=subtype, filename=filename)
+    for _, _, image_bytes, filename in attachments:
+        subtype = filename.split(".")[-1]
+        if subtype == "jpg":
+            subtype = "jpeg"
+        msg.add_attachment(image_bytes, maintype="image", subtype=subtype, filename=filename)
 
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
@@ -122,6 +151,8 @@ def main():
     sender = os.environ.get("GMAIL_ADDRESS")
     app_password = os.environ.get("GMAIL_APP_PASSWORD")
     recipient = os.environ.get("MEME_RECIPIENT")
+    vote_threshold = int(os.environ.get("VOTE_THRESHOLD", "5000"))
+    max_memes = int(os.environ.get("MAX_MEMES", "20"))
 
     missing = [name for name, val in [
         ("GMAIL_ADDRESS", sender),
@@ -132,16 +163,24 @@ def main():
         print(f"Missing required environment variables: {', '.join(missing)}", file=sys.stderr)
         sys.exit(1)
 
-    print("Fetching top meme from 9gag...")
-    title, image_bytes, filename = get_top_meme()
-    print(f"Found: {title}")
+    print(f"Fetching hot memes with more than {vote_threshold} upvotes...")
+    memes = get_top_memes(vote_threshold, max_memes)
 
-    print(f"Emailing to {recipient}...")
+    if not memes:
+        print(f"No memes found above {vote_threshold} upvotes today — not sending an email.")
+        return
+
+    print(f"Found {len(memes)} meme(s). Emailing to {recipient}...")
+
+    lines = [f"Today's top memes from 9gag (more than {vote_threshold} upvotes):", ""]
+    for title, votes, _, _ in memes:
+        lines.append(f"- {title} ({votes} upvotes)")
+    body = "\n".join(lines)
+
     send_email(
-        subject=f"Top meme of the day: {title}",
-        body=f"Today's top meme from 9gag:\n\n{title}",
-        image_bytes=image_bytes,
-        filename=filename,
+        subject=f"Top memes of the day: {len(memes)} posts over {vote_threshold} upvotes",
+        body=body,
+        attachments=memes,
         sender=sender,
         app_password=app_password,
         recipient=recipient,
