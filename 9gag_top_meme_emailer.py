@@ -48,13 +48,23 @@ from email.message import EmailMessage
 import requests
 
 # 9gag's unofficial hot-feed API (no auth required for SFW content)
-NINEGAG_HOT_URL = "https://9gag.com/v1/group-posts/group/hot/type/hot"
+# Format is /group-posts/group/<GROUP>/type/<SECTION> — "default" is the
+# main 9gag group, "hot" is the section (hot/fresh/trending).
+NINEGAG_HOT_URL = "https://9gag.com/v1/group-posts/group/default/type/hot"
 
 
 def get_top_meme():
     """Return (title, image_bytes, filename) for today's #1 hot post."""
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; MemeBot/1.0)"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://9gag.com/hot",
+    }
     resp = requests.get(NINEGAG_HOT_URL, headers=headers, timeout=15)
+    if resp.status_code != 200:
+        # Surface the response body — 9gag's error messages are useful for debugging.
+        print(f"9gag API returned {resp.status_code}: {resp.text[:500]}", file=sys.stderr)
     resp.raise_for_status()
     data = resp.json()
 
