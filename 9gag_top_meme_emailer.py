@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-9gag Top Memes of the Day -> Email
+9gag Top Memes of the Day -> Email (HTML digest)
 
 Fetches posts from 9gag's "hot" feed, ranks them by upvote count, and emails
-the top MAX_MEMES of them (default 30) as attachments in a single email via
-Gmail.
+the top MAX_MEMES of them (default 30) as an HTML grid/gallery digest —
+images shown inline in the email body AND attached as files, each linking
+back to the original 9gag post.
 
 SETUP
 -----
@@ -20,7 +21,8 @@ SETUP
        export GMAIL_ADDRESS="youraddress@gmail.com"
        export GMAIL_APP_PASSWORD="16-char-app-password"
        export MEME_RECIPIENT="where-to-send@example.com"
-       export MAX_MEMES="30"             # optional, how many top memes to send
+       export MAX_MEMES="30"      # optional, how many top memes to send
+       export GRID_COLUMNS="3"    # optional, cards per row in the email
 
 4. Run it:
        python 9gag_top_meme_emailer.py
@@ -35,7 +37,10 @@ import os
 import smtplib
 import ssl
 import sys
-from email.message import EmailMessage
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from html import escape
 
 import requests
 
@@ -103,25 +108,36 @@ def collect_candidates():
                 "title": post.get("title", "Untitled meme"),
                 "votes": post.get("upVoteCount", 0),
                 "image_url": post["images"]["image700"]["url"],
+                "post_url": post.get("url") or f"https://9gag.com/gag/{post_id}",
             })
 
     return candidates
 
 
-def download_meme(candidate):
-    """Download the image for a candidate and return (title, votes, image_bytes, filename)."""
+def download_meme(candidate, rank):
+    """Download the image and return a dict with everything needed for the email."""
     img_resp = requests.get(candidate["image_url"], headers=HEADERS, timeout=15)
     img_resp.raise_for_status()
 
     ext = candidate["image_url"].split(".")[-1].split("?")[0]
+    subtype = "jpeg" if ext == "jpg" else ext
     safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in candidate["title"])[:50].strip()
-    filename = f"{candidate['votes']}_{safe_title or candidate['id']}.{ext}"
+    filename = f"{rank:02d}_{candidate['votes']}_{safe_title or candidate['id']}.{ext}"
 
-    return candidate["title"], candidate["votes"], img_resp.content, filename
+    return {
+        "rank": rank,
+        "title": candidate["title"],
+        "votes": candidate["votes"],
+        "post_url": candidate["post_url"],
+        "image_bytes": img_resp.content,
+        "subtype": subtype,
+        "filename": filename,
+        "cid": f"meme{rank}",
+    }
 
 
 def get_top_memes(max_memes):
-    """Return the top `max_memes` hot posts, ranked by upvote count."""
+    """Return the top `max_memes` hot posts, ranked by upvote count, with images downloaded."""
     candidates = collect_candidates()
     if not candidates:
         return []
@@ -130,26 +146,90 @@ def get_top_memes(max_memes):
     top_candidates = candidates[:max_memes]
 
     memes = []
-    for candidate in top_candidates:
-        meme = download_meme(candidate)
+    for rank, candidate in enumerate(top_candidates, start=1):
+        meme = download_meme(candidate, rank)
         memes.append(meme)
-        print(f"  included: {meme[0]} ({meme[1]} upvotes)")
+        print(f"  #{rank}: {meme['title']} ({meme['votes']} upvotes)")
 
     return memes
 
 
-def send_email(subject, body, attachments, sender, app_password, recipient):
-    msg = EmailMessage()
+def build_html(memes, columns):
+    """Build an HTML grid/gallery digest, images referenced via cid: for inline display."""
+    cards = []
+    for m in memes:
+        title = escape(m["title"])
+        cards.append(f"""
+        <td style="padding:8px; vertical-align:top; width:{100 // columns}%;">
+          <a href="{escape(m['post_url'])}" style="text-decoration:none; color:inherit;">
+            <div style="border:1px solid #e0e0e0; border-radius:10px; overflow:hidden; font-family:Arial,Helvetica,sans-serif;">
+              <div style="position:relative;">
+                <img src="cid:{m['cid']}" alt="{title}" style="display:block; width:100%; height:180px; object-fit:cover;">
+                <span style="position:absolute; top:6px; left:6px; background:rgba(0,0,0,0.65); color:#fff; font-size:12px; padding:2px 7px; border-radius:12px;">#{m['rank']}</span>
+              </div>
+              <div style="padding:10px;">
+                <div style="font-size:13px; color:#222; line-height:1.35; max-height:52px; overflow:hidden;">{title}</div>
+                <div style="font-size:12px; color:#888; margin-top:6px;">&#9650; {m['votes']:,} upvotes</div>
+              </div>
+            </div>
+          </a>
+        </td>""")
+
+    # group cards into rows of `columns`
+    rows = []
+    for i in range(0, len(cards), columns):
+        row_cards = cards[i:i + columns]
+        # pad the last row so columns stay aligned
+        row_cards += ["<td></td>"] * (columns - len(row_cards))
+        rows.append(f"<tr>{''.join(row_cards)}</tr>")
+
+    return f"""\
+<html>
+  <body style="margin:0; padding:20px; background:#f4f4f4; font-family:Arial,Helvetica,sans-serif;">
+    <h2 style="color:#222;">Today's Top {len(memes)} Memes from 9gag</h2>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:900px;">
+      {''.join(rows)}
+    </table>
+    <p style="color:#999; font-size:12px; margin-top:20px;">Ranked by upvotes on 9gag's hot feed. Tap any card to view the original post.</p>
+  </body>
+</html>"""
+
+
+def build_plain_text(memes):
+    lines = [f"Today's top {len(memes)} memes from 9gag (ranked by upvotes):", ""]
+    for m in memes:
+        lines.append(f"#{m['rank']} - {m['title']} ({m['votes']} upvotes) - {m['post_url']}")
+    return "\n".join(lines)
+
+
+def send_email(subject, memes, columns, sender, app_password, recipient):
+    msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = recipient
-    msg.set_content(body)
 
-    for _, _, image_bytes, filename in attachments:
-        subtype = filename.split(".")[-1]
-        if subtype == "jpg":
-            subtype = "jpeg"
-        msg.add_attachment(image_bytes, maintype="image", subtype=subtype, filename=filename)
+    # multipart/related holds the HTML body + its inline (cid) images
+    msg_related = MIMEMultipart("related")
+    msg.attach(msg_related)
+
+    msg_alt = MIMEMultipart("alternative")
+    msg_related.attach(msg_alt)
+
+    msg_alt.attach(MIMEText(build_plain_text(memes), "plain"))
+    msg_alt.attach(MIMEText(build_html(memes, columns), "html"))
+
+    # inline copies (referenced by the HTML via cid:)
+    for m in memes:
+        img = MIMEImage(m["image_bytes"], _subtype=m["subtype"])
+        img.add_header("Content-ID", f"<{m['cid']}>")
+        img.add_header("Content-Disposition", "inline", filename=m["filename"])
+        msg_related.attach(img)
+
+    # regular file attachments (same images, downloadable)
+    for m in memes:
+        img = MIMEImage(m["image_bytes"], _subtype=m["subtype"])
+        img.add_header("Content-Disposition", "attachment", filename=m["filename"])
+        msg.attach(img)
 
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
@@ -162,6 +242,7 @@ def main():
     app_password = os.environ.get("GMAIL_APP_PASSWORD")
     recipient = os.environ.get("MEME_RECIPIENT")
     max_memes = int(os.environ.get("MAX_MEMES", "30"))
+    columns = int(os.environ.get("GRID_COLUMNS", "3"))
 
     missing = [name for name, val in [
         ("GMAIL_ADDRESS", sender),
@@ -180,16 +261,10 @@ def main():
         return
 
     print(f"Found {len(memes)} meme(s). Emailing to {recipient}...")
-
-    lines = [f"Today's top {len(memes)} memes from 9gag, ranked by upvotes:", ""]
-    for title, votes, _, _ in memes:
-        lines.append(f"- {title} ({votes} upvotes)")
-    body = "\n".join(lines)
-
     send_email(
         subject=f"Top {len(memes)} memes of the day",
-        body=body,
-        attachments=memes,
+        memes=memes,
+        columns=columns,
         sender=sender,
         app_password=app_password,
         recipient=recipient,
