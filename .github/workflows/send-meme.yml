@@ -28,6 +28,7 @@ jobs:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           MEME_RECIPIENT: ${{ secrets.MEME_RECIPIENT }}
-          MAX_MEMES: "30"          # how many top-voted memes to include per email
-          GRID_COLUMNS: "3"        # cards per row in the HTML digest
+          MAX_MEMES: "30"                 # how many top-voted memes to include per email
+          GRID_COLUMNS: "3"               # cards per row in the HTML digest
+          TIMEZONE: "Asia/Ho_Chi_Minh"    # used for the date/time shown in the subject line
         run: python 9gag_top_meme_emailer.py
