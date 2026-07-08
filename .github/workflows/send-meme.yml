@@ -1,0 +1,31 @@
+name: Send Top Meme of the Day
+
+on:
+  schedule:
+    # Runs at 09:00 UTC every day. Edit the cron below to change the time.
+    # Cron is always UTC on GitHub Actions — convert your local time.
+    # e.g. 9am ICT (Vietnam, UTC+7) = 2am UTC -> "0 2 * * *"
+    - cron: "0 9 * * *"
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab to test
+
+jobs:
+  send-meme:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run meme emailer
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          MEME_RECIPIENT: ${{ secrets.MEME_RECIPIENT }}
+        run: python 9gag_top_meme_emailer.py
