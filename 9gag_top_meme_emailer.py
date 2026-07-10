@@ -45,6 +45,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 from email import encoders
 from email.mime.base import MIMEBase
@@ -85,11 +86,50 @@ GIF_WIDTH = 380
 GIF_FPS = 10
 FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
 
+# Media download reliability tuning. 9gag's CDN occasionally rate-limits or
+# hotlink-blocks a fraction of rapid-fire requests, returning a small error
+# response with a 200 status instead of the real file — this shows up as a
+# broken image in the email. We retry those and add a small delay between
+# requests to reduce how often it happens in the first place.
+DOWNLOAD_RETRIES = 3
+DOWNLOAD_RETRY_BACKOFF_SECONDS = 1.5
+MIN_VALID_IMAGE_BYTES = 500
+REQUEST_DELAY_SECONDS = 0.3
+
 SECTIONS = [
     ("photo", "Static Images", "\U0001F5BC"),
     ("video", "Videos", "\U0001F3A5"),
     ("gif", "GIFs", "\U0001F39E"),
 ]
+
+
+def fetch_media_bytes(url, expect="image", retries=DOWNLOAD_RETRIES):
+    """GET a URL and return its bytes, retrying if the response doesn't look
+    like real media (wrong content-type or suspiciously small — a common
+    sign of a CDN rate-limit/error page returned with a 200 status).
+    """
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=30)
+            resp.raise_for_status()
+            content_type = resp.headers.get("Content-Type", "")
+            content = resp.content
+
+            looks_valid = (
+                len(content) >= MIN_VALID_IMAGE_BYTES
+                and (expect in content_type or content_type == "")
+            )
+            if looks_valid:
+                return content
+            last_error = f"unexpected response (content-type={content_type!r}, size={len(content)})"
+        except requests.RequestException as e:
+            last_error = str(e)
+
+        if attempt < retries:
+            time.sleep(DOWNLOAD_RETRY_BACKOFF_SECONDS * attempt)
+
+    raise RuntimeError(f"Failed to download valid {expect} from {url}: {last_error}")
 
 
 def fetch_hot_pages(max_pages=MAX_CANDIDATE_PAGES):
@@ -224,11 +264,15 @@ def download_meme(candidate, rank, running_total_bytes):
     """Download the thumbnail (always) and, for video/gif posts, build an
     animated GIF preview + attach the full original video (size permitting).
 
-    Returns (meme_dict, new_running_total_bytes).
+    Returns (meme_dict_or_None, new_running_total_bytes). Returns None for
+    the meme if even retries couldn't get a valid thumbnail — the caller
+    should skip this candidate rather than embed a broken image.
     """
-    thumb_resp = requests.get(candidate["thumb_url"], headers=HEADERS, timeout=15)
-    thumb_resp.raise_for_status()
-    thumb_bytes = thumb_resp.content
+    try:
+        thumb_bytes = fetch_media_bytes(candidate["thumb_url"], expect="image")
+    except RuntimeError as e:
+        print(f"  {candidate['category']} #{rank}: thumbnail failed, skipping - {e}", file=sys.stderr)
+        return None, running_total_bytes
 
     thumb_ext = candidate["thumb_url"].split(".")[-1].split("?")[0]
     thumb_subtype = "jpeg" if thumb_ext == "jpg" else thumb_ext
@@ -256,9 +300,7 @@ def download_meme(candidate, rank, running_total_bytes):
     if candidate["video_url"]:
         if running_total_bytes < MAX_EMAIL_BYTES:
             try:
-                video_resp = requests.get(candidate["video_url"], headers=HEADERS, timeout=30)
-                video_resp.raise_for_status()
-                video_bytes = video_resp.content
+                video_bytes = fetch_media_bytes(candidate["video_url"], expect="video")
 
                 # Animated GIF preview so it plays natively inline in the email
                 # (mp4 can't autoplay inline in most mail clients).
@@ -277,11 +319,12 @@ def download_meme(candidate, rank, running_total_bytes):
                     running_total_bytes += len(video_bytes)
                 else:
                     print(f"  {candidate['category']} #{rank}: skipping full video attachment (size budget)")
-            except requests.RequestException as e:
-                print(f"  {candidate['category']} #{rank}: video download failed ({e})", file=sys.stderr)
+            except RuntimeError as e:
+                print(f"  {candidate['category']} #{rank}: video download failed, using thumbnail only - {e}", file=sys.stderr)
         else:
             print(f"  {candidate['category']} #{rank}: skipping video (size budget)")
 
+    time.sleep(REQUEST_DELAY_SECONDS)
     return meme, running_total_bytes
 
 
@@ -291,20 +334,28 @@ def get_top_memes_by_section(per_section):
 
     Processing order is photo -> gif -> video, so if the size budget runs
     tight, it's the heaviest items (full videos) that degrade first, not
-    the cheap static images.
+    the cheap static images. Candidates that fail to download validly (even
+    after retries) are skipped in favor of the next-highest-voted one, so
+    a section still fills up to `per_section` whenever enough candidates exist.
     """
     buckets = collect_candidates(per_section)
 
     result = {}
     running_total_bytes = 0
     for category in ("photo", "gif", "video"):
-        candidates = sorted(buckets[category], key=lambda c: c["votes"], reverse=True)[:per_section]
+        candidates = sorted(buckets[category], key=lambda c: c["votes"], reverse=True)
         memes = []
-        for rank, candidate in enumerate(candidates, start=1):
+        rank = 1
+        for candidate in candidates:
+            if len(memes) >= per_section:
+                break
             meme, running_total_bytes = download_meme(candidate, rank, running_total_bytes)
+            if meme is None:
+                continue  # thumbnail failed even after retries — try the next candidate
             memes.append(meme)
             tag = "gif preview" if meme["has_gif_preview"] else "image"
             print(f"  {category} #{rank} [{tag}]: {meme['title']} ({meme['votes']} upvotes)")
+            rank += 1
         result[category] = memes
 
     return result
