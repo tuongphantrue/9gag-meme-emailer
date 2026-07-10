@@ -2,10 +2,9 @@ name: Send Top Meme of the Day
 
 on:
   schedule:
-    # Runs at 09:00 UTC every day. Edit the cron below to change the time.
+    # Runs at 02:00 UTC = 09:00 Hanoi time (UTC+7) every day.
     # Cron is always UTC on GitHub Actions — convert your local time.
-    # e.g. 9am ICT (Vietnam, UTC+7) = 2am UTC -> "0 2 * * *"
-    - cron: "0 9 * * *"
+    - cron: "0 2 * * *"
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab to test
 
 jobs:
@@ -28,7 +27,7 @@ jobs:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           MEME_RECIPIENT: ${{ secrets.MEME_RECIPIENT }}
-          MAX_MEMES: "30"                 # how many top-voted memes to include per email
+          MEMES_PER_SECTION: "30"         # top N per section (static image / video / gif)
           GRID_COLUMNS: "3"               # cards per row in the HTML digest
           TIMEZONE: "Asia/Ho_Chi_Minh"    # used for the date/time shown in the subject line
         run: python 9gag_top_meme_emailer.py
