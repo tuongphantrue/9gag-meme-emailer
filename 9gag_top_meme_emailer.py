@@ -232,7 +232,7 @@ def build_html(memes, columns):
           <a href="{escape(m['post_url'])}" style="text-decoration:none; color:inherit;">
             <div style="border:1px solid #e0e0e0; border-radius:10px; overflow:hidden; font-family:Arial,Helvetica,sans-serif;">
               <div style="position:relative;">
-                <img src="cid:{m['cid']}" alt="{title}" style="display:block; width:100%; height:180px; object-fit:cover;">
+                <img src="cid:{m['cid']}" alt="{title}" style="display:block; width:100%; height:auto; max-height:500px; object-fit:contain; background:#f5f5f5;">
                 <span style="position:absolute; top:6px; left:6px; background:rgba(0,0,0,0.65); color:#fff; font-size:12px; padding:2px 7px; border-radius:12px;">#{m['rank']}</span>
                 {play_badge}
               </div>
