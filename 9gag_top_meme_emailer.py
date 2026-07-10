@@ -4,8 +4,9 @@
 
 Fetches posts from 9gag's "hot" feed, ranks them by upvote count, and emails
 the top MAX_MEMES of them (default 30) as an HTML grid/gallery digest —
-images shown inline in the email body AND attached as files, each linking
-back to the original 9gag post.
+thumbnails shown inline in the email body, with the full original file
+attached below (an .mp4 for gifs/videos, the image itself for photos), each
+card linking back to the original 9gag post.
 
 SETUP
 -----
@@ -39,6 +40,8 @@ import smtplib
 import ssl
 import sys
 from datetime import datetime
+from email import encoders
+from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -62,6 +65,11 @@ HEADERS = {
 # is ranked by a "hot score" (not pure vote count), so we gather a decent
 # pool of candidates before picking the highest-voted ones out of it.
 CANDIDATE_PAGES = 15
+
+# Gmail's hard cap is ~25MB per message. Leave headroom for MIME/base64
+# overhead (base64 inflates size by ~33%) and stop adding videos once we're
+# getting close, falling back to thumbnail-only for the rest.
+MAX_EMAIL_BYTES = 20 * 1024 * 1024
 
 
 def fetch_hot_pages(max_pages=CANDIDATE_PAGES):
@@ -89,7 +97,7 @@ def fetch_hot_pages(max_pages=CANDIDATE_PAGES):
 
 
 def collect_candidates():
-    """Gather SFW image/gif post metadata (no image download yet) from the hot feed."""
+    """Gather SFW image/gif/video post metadata (no downloads yet) from the hot feed."""
     candidates = []
     seen_ids = set()
 
@@ -102,44 +110,91 @@ def collect_candidates():
 
             if post.get("nsfw", 0):
                 continue
-            if post.get("type") not in ("Photo", "Animated"):
+
+            post_type = post.get("type")
+            if post_type not in ("Photo", "Animated"):
                 continue
+
+            images = post.get("images", {})
+            # Static thumbnail — always available, used for the inline grid image.
+            thumb_url = (images.get("image700") or images.get("image460") or {}).get("url")
+            if not thumb_url:
+                continue
+
+            # Animated posts (gifs/videos) additionally have a real video file.
+            video_url = None
+            if post_type == "Animated":
+                video_info = images.get("image460sv")
+                if video_info and video_info.get("url"):
+                    video_url = video_info["url"]
 
             candidates.append({
                 "id": post_id,
                 "title": post.get("title", "Untitled meme"),
                 "votes": post.get("upVoteCount", 0),
-                "image_url": post["images"]["image700"]["url"],
+                "thumb_url": thumb_url,
+                "video_url": video_url,
+                "is_video": video_url is not None,
                 "post_url": post.get("url") or f"https://9gag.com/gag/{post_id}",
             })
 
     return candidates
 
 
-def download_meme(candidate, rank):
-    """Download the image and return a dict with everything needed for the email."""
-    img_resp = requests.get(candidate["image_url"], headers=HEADERS, timeout=15)
-    img_resp.raise_for_status()
+def download_meme(candidate, rank, running_total_bytes):
+    """Download the thumbnail (always) and the full video (if present and size allows).
 
-    ext = candidate["image_url"].split(".")[-1].split("?")[0]
-    subtype = "jpeg" if ext == "jpg" else ext
+    Returns (meme_dict, new_running_total_bytes).
+    """
+    thumb_resp = requests.get(candidate["thumb_url"], headers=HEADERS, timeout=15)
+    thumb_resp.raise_for_status()
+    thumb_bytes = thumb_resp.content
+
+    thumb_ext = candidate["thumb_url"].split(".")[-1].split("?")[0]
+    thumb_subtype = "jpeg" if thumb_ext == "jpg" else thumb_ext
     safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in candidate["title"])[:50].strip()
-    filename = f"{rank:02d}_{candidate['votes']}_{safe_title or candidate['id']}.{ext}"
+    base_name = f"{rank:02d}_{candidate['votes']}_{safe_title or candidate['id']}"
 
-    return {
+    meme = {
         "rank": rank,
         "title": candidate["title"],
         "votes": candidate["votes"],
         "post_url": candidate["post_url"],
-        "image_bytes": img_resp.content,
-        "subtype": subtype,
-        "filename": filename,
+        "is_video": False,
+        "thumb_bytes": thumb_bytes,
+        "thumb_subtype": thumb_subtype,
+        "thumb_filename": f"{base_name}.{thumb_ext}",
         "cid": f"meme{rank}",
+        "video_bytes": None,
+        "video_filename": None,
     }
+
+    running_total_bytes += len(thumb_bytes)
+
+    if candidate["is_video"]:
+        # Only attempt the video if we still have headroom in the size budget.
+        if running_total_bytes < MAX_EMAIL_BYTES:
+            try:
+                video_resp = requests.get(candidate["video_url"], headers=HEADERS, timeout=30)
+                video_resp.raise_for_status()
+                video_bytes = video_resp.content
+                if running_total_bytes + len(video_bytes) < MAX_EMAIL_BYTES:
+                    meme["is_video"] = True
+                    meme["video_bytes"] = video_bytes
+                    meme["video_filename"] = f"{base_name}.mp4"
+                    running_total_bytes += len(video_bytes)
+                else:
+                    print(f"  #{rank}: skipping video attachment (size budget) - {candidate['title']}")
+            except requests.RequestException as e:
+                print(f"  #{rank}: video download failed ({e}), using thumbnail only", file=sys.stderr)
+        else:
+            print(f"  #{rank}: skipping video attachment (size budget) - {candidate['title']}")
+
+    return meme, running_total_bytes
 
 
 def get_top_memes(max_memes):
-    """Return the top `max_memes` hot posts, ranked by upvote count, with images downloaded."""
+    """Return the top `max_memes` hot posts, ranked by upvote count, with media downloaded."""
     candidates = collect_candidates()
     if not candidates:
         return []
@@ -148,10 +203,12 @@ def get_top_memes(max_memes):
     top_candidates = candidates[:max_memes]
 
     memes = []
+    running_total_bytes = 0
     for rank, candidate in enumerate(top_candidates, start=1):
-        meme = download_meme(candidate, rank)
+        meme, running_total_bytes = download_meme(candidate, rank, running_total_bytes)
         memes.append(meme)
-        print(f"  #{rank}: {meme['title']} ({meme['votes']} upvotes)")
+        tag = "video" if meme["is_video"] else "image"
+        print(f"  #{rank} [{tag}]: {meme['title']} ({meme['votes']} upvotes)")
 
     return memes
 
@@ -161,6 +218,15 @@ def build_html(memes, columns):
     cards = []
     for m in memes:
         title = escape(m["title"])
+        play_badge = (
+            '<span style="position:absolute; top:6px; right:6px; background:rgba(0,0,0,0.65); '
+            'color:#fff; font-size:12px; padding:2px 7px; border-radius:12px;">&#9654; GIF/Video</span>'
+            if m["is_video"] else ""
+        )
+        note = (
+            '<div style="font-size:11px; color:#4a90d9; margin-top:4px;">Full video attached below</div>'
+            if m["is_video"] else ""
+        )
         cards.append(f"""
         <td style="padding:8px; vertical-align:top; width:{100 // columns}%;">
           <a href="{escape(m['post_url'])}" style="text-decoration:none; color:inherit;">
@@ -168,10 +234,12 @@ def build_html(memes, columns):
               <div style="position:relative;">
                 <img src="cid:{m['cid']}" alt="{title}" style="display:block; width:100%; height:180px; object-fit:cover;">
                 <span style="position:absolute; top:6px; left:6px; background:rgba(0,0,0,0.65); color:#fff; font-size:12px; padding:2px 7px; border-radius:12px;">#{m['rank']}</span>
+                {play_badge}
               </div>
               <div style="padding:10px;">
                 <div style="font-size:13px; color:#222; line-height:1.35; max-height:52px; overflow:hidden;">{title}</div>
                 <div style="font-size:12px; color:#888; margin-top:6px;">&#9650; {m['votes']:,} upvotes</div>
+                {note}
               </div>
             </div>
           </a>
@@ -200,7 +268,8 @@ def build_html(memes, columns):
 def build_plain_text(memes):
     lines = [f"Today's top {len(memes)} memes from 9gag (ranked by upvotes):", ""]
     for m in memes:
-        lines.append(f"#{m['rank']} - {m['title']} ({m['votes']} upvotes) - {m['post_url']}")
+        tag = " [video attached]" if m["is_video"] else ""
+        lines.append(f"#{m['rank']} - {m['title']} ({m['votes']} upvotes){tag} - {m['post_url']}")
     return "\n".join(lines)
 
 
@@ -210,7 +279,7 @@ def send_email(subject, memes, columns, sender, app_password, recipient):
     msg["From"] = sender
     msg["To"] = recipient
 
-    # multipart/related holds the HTML body + its inline (cid) images
+    # multipart/related holds the HTML body + its inline (cid) thumbnail images
     msg_related = MIMEMultipart("related")
     msg.attach(msg_related)
 
@@ -220,18 +289,26 @@ def send_email(subject, memes, columns, sender, app_password, recipient):
     msg_alt.attach(MIMEText(build_plain_text(memes), "plain"))
     msg_alt.attach(MIMEText(build_html(memes, columns), "html"))
 
-    # inline copies (referenced by the HTML via cid:)
+    # inline thumbnail copies (referenced by the HTML via cid:) — always images,
+    # since email clients can't reliably autoplay inline <video>.
     for m in memes:
-        img = MIMEImage(m["image_bytes"], _subtype=m["subtype"])
+        img = MIMEImage(m["thumb_bytes"], _subtype=m["thumb_subtype"])
         img.add_header("Content-ID", f"<{m['cid']}>")
-        img.add_header("Content-Disposition", "inline", filename=m["filename"])
+        img.add_header("Content-Disposition", "inline", filename=m["thumb_filename"])
         msg_related.attach(img)
 
-    # regular file attachments (same images, downloadable)
+    # regular file attachments: full mp4 for videos, static image otherwise
     for m in memes:
-        img = MIMEImage(m["image_bytes"], _subtype=m["subtype"])
-        img.add_header("Content-Disposition", "attachment", filename=m["filename"])
-        msg.attach(img)
+        if m["is_video"]:
+            video = MIMEBase("video", "mp4")
+            video.set_payload(m["video_bytes"])
+            encoders.encode_base64(video)
+            video.add_header("Content-Disposition", "attachment", filename=m["video_filename"])
+            msg.attach(video)
+        else:
+            img = MIMEImage(m["thumb_bytes"], _subtype=m["thumb_subtype"])
+            img.add_header("Content-Disposition", "attachment", filename=m["thumb_filename"])
+            msg.attach(img)
 
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
