@@ -74,6 +74,7 @@ from html import escape
 
 import requests
 from PIL import Image
+from urllib.parse import quote
 
 # 9gag's unofficial hot-feed API (no auth required for SFW content)
 # Format is /group-posts/group/<GROUP>/type/<SECTION> — "default" is the
@@ -320,7 +321,8 @@ def download_meme(candidate, rank, output_dir):
         print(f"  {candidate['category']} #{rank}: thumbnail failed, skipping - {e}", file=sys.stderr)
         return None
 
-    safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in candidate["title"])[:50].strip()
+    safe_title = "".join(c if c.isalnum() else "_" for c in candidate["title"])
+    safe_title = "_".join(filter(None, safe_title.split("_")))[:50]  # collapse repeats, trim
     base_name = f"{candidate['category']}_{rank:02d}_{candidate['votes']}_{safe_title or candidate['id']}"
 
     file_bytes, ext = compress_image(raw_bytes)
@@ -395,7 +397,7 @@ def build_section_html(title, emoji, memes, columns, image_base_url):
     cards = []
     for m in memes:
         title_esc = escape(m["title"])
-        img_url = f"{image_base_url}/{m['filename']}"
+        img_url = f"{image_base_url}/{quote(m['filename'])}"
         play_badge = (
             '<span style="position:absolute; top:6px; right:6px; background:rgba(0,0,0,0.65); '
             'color:#fff; font-size:12px; padding:2px 7px; border-radius:12px;">&#9654; GIF</span>'
