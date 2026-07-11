@@ -118,8 +118,18 @@ SECTIONS = [
     ("gif", "GIFs", "\U0001F39E"),
 ]
 
-PREVIEWS_DIR = "previews"
+PREVIEWS_ROOT = "previews"
 EMAIL_DIR = "email"
+
+# Every run gets its own subfolder (based on the unique GitHub Actions run
+# ID) instead of overwriting the same file paths each day. raw.githubuser
+# content.com (and Gmail's own image-proxy fetching it) is a CDN with edge
+# caching — reusing the same path daily can serve stale/inconsistent
+# results right after a fresh push, since different edges pick up the
+# update at different times. A path that's never been requested before has
+# nothing stale to collide with.
+RUN_ID = os.environ.get("GITHUB_RUN_ID") or datetime.now().strftime("%Y%m%d%H%M%S")
+PREVIEWS_DIR = f"{PREVIEWS_ROOT}/{RUN_ID}"
 
 
 def fetch_media_bytes(url, expect="image", retries=DOWNLOAD_RETRIES):
