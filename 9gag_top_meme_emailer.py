@@ -50,6 +50,8 @@ SETUP
        export GITHUB_REPOSITORY="yourname/9gag-meme-emailer"  # owner/repo,
                                             # auto-set already inside GitHub Actions
        export IMAGE_BRANCH="meme-assets"   # optional, branch images are hosted on
+       export SENT_IDS_FILE="state/sent_ids.json"  # optional, dedup state file
+       export SENT_ID_CAP="20000"          # optional, max tracked ids to retain
 
 SCHEDULING
 ----------
@@ -89,10 +91,12 @@ HEADERS = {
 }
 
 # How many feed pages to scan when building the candidate pool. We need
-# enough pages to find MEMES_PER_SECTION posts in each of the 3 categories,
-# and videos/gifs are much rarer than photos in the hot feed. Each page is
-# ~10 posts.
-MAX_CANDIDATE_PAGES = 60
+# enough pages to find MEMES_PER_SECTION *new* (not-already-sent) posts in
+# each of the 3 categories, and videos/gifs are much rarer than photos in
+# the hot feed. Each page is ~10 posts. When running hourly with dedup
+# enabled, the top of the feed is often already-sent, so this may need to
+# be scanned deeper than a once-a-day run would.
+MAX_CANDIDATE_PAGES = int(os.environ.get("MAX_CANDIDATE_PAGES", "60"))
 
 # Media download reliability tuning. 9gag's CDN occasionally rate-limits or
 # hotlink-blocks a fraction of rapid-fire requests, returning a small error
@@ -131,6 +135,42 @@ EMAIL_DIR = "email"
 # nothing stale to collide with.
 RUN_ID = os.environ.get("GITHUB_RUN_ID") or datetime.now().strftime("%Y%m%d%H%M%S")
 PREVIEWS_DIR = f"{PREVIEWS_ROOT}/{RUN_ID}"
+
+# Dedup state: a JSON file listing post IDs already emailed in a previous
+# run, so re-running (hourly, etc.) sends only *new* memes off the hot feed
+# instead of re-sending whatever's still sitting at the top. The workflow
+# is responsible for fetching this file from the meme-assets branch before
+# `generate` runs, and for committing the updated version back afterward —
+# this script only reads/writes the local path.
+SENT_IDS_FILE = os.environ.get("SENT_IDS_FILE", "state/sent_ids.json")
+SENT_ID_CAP = int(os.environ.get("SENT_ID_CAP", "20000"))
+
+
+def load_sent_ids(path=SENT_IDS_FILE):
+    """Return (ordered_list, set) of previously-sent post IDs. Missing or
+    corrupt state files are treated as "nothing sent yet" rather than a
+    fatal error, so a fresh repo / first run just works.
+    """
+    if not os.path.exists(path):
+        return [], set()
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        ids = [int(i) for i in data.get("ids", [])]
+        return ids, set(ids)
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        print(f"  could not read {path} ({e}) — starting with empty dedup state", file=sys.stderr)
+        return [], set()
+
+
+def save_sent_ids(ordered_ids, path=SENT_IDS_FILE):
+    """Persist the (oldest-first) list of sent post IDs, trimmed to
+    SENT_ID_CAP so the file doesn't grow forever.
+    """
+    trimmed = ordered_ids[-SENT_ID_CAP:] if len(ordered_ids) > SENT_ID_CAP else ordered_ids
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"ids": trimmed, "updated": datetime.utcnow().isoformat() + "Z"}, f)
 
 
 def fetch_media_bytes(url, expect="image", retries=DOWNLOAD_RETRIES):
@@ -262,14 +302,16 @@ def classify_post(post):
     return None
 
 
-def collect_candidates(per_section_target):
+def collect_candidates(per_section_target, sent_ids=frozenset()):
     """Gather SFW post metadata (no downloads yet), grouped by category.
 
     Pages through the hot feed until each category has at least
-    `per_section_target` candidates, or MAX_CANDIDATE_PAGES is reached.
+    `per_section_target` *new* (not already in sent_ids) candidates, or
+    MAX_CANDIDATE_PAGES is reached.
     """
     buckets = {"photo": [], "video": [], "gif": []}
     seen_ids = set()
+    skipped_already_sent = 0
 
     for posts in fetch_hot_pages():
         for post in posts:
@@ -277,6 +319,10 @@ def collect_candidates(per_section_target):
             if post_id in seen_ids:
                 continue
             seen_ids.add(post_id)
+
+            if post_id in sent_ids:
+                skipped_already_sent += 1
+                continue
 
             category = classify_post(post)
             if category is None:
@@ -303,6 +349,9 @@ def collect_candidates(per_section_target):
 
         if all(len(buckets[cat]) >= per_section_target for cat in buckets):
             break
+
+    if skipped_already_sent:
+        print(f"  skipped {skipped_already_sent} already-sent post(s) from the feed")
 
     return buckets
 
@@ -350,6 +399,7 @@ def download_meme(candidate, rank, output_dir):
     time.sleep(REQUEST_DELAY_SECONDS)
 
     return {
+        "id": candidate["id"],
         "rank": rank,
         "category": candidate["category"],
         "title": candidate["title"],
@@ -360,13 +410,14 @@ def download_meme(candidate, rank, output_dir):
     }
 
 
-def get_top_memes_by_section(per_section, output_dir):
+def get_top_memes_by_section(per_section, output_dir, sent_ids=frozenset()):
     """Return {'photo': [...], 'video': [...], 'gif': [...]}, each the top
-    `per_section` posts of that category ranked by upvotes, media saved to
-    output_dir. Candidates that fail to download validly (even after
-    retries) are skipped in favor of the next-highest-voted one.
+    `per_section` *new* posts of that category ranked by upvotes, media
+    saved to output_dir. Candidates that fail to download validly (even
+    after retries) are skipped in favor of the next-highest-voted one.
+    Posts whose ID is already in sent_ids are excluded entirely.
     """
-    buckets = collect_candidates(per_section)
+    buckets = collect_candidates(per_section, sent_ids=sent_ids)
 
     result = {}
     for category in ("photo", "gif", "video"):
@@ -391,8 +442,8 @@ def get_top_memes_by_section(per_section, output_dir):
 def build_section_html(title, emoji, memes, columns, image_base_url):
     if not memes:
         return f"""
-    <h2 style="color:#222; font-family:Arial,Helvetica,sans-serif;">{emoji} Top {title}</h2>
-    <p style="color:#999; font-size:13px; font-family:Arial,Helvetica,sans-serif;">No qualifying posts found today.</p>"""
+    <h2 style="color:#222; font-family:Arial,Helvetica,sans-serif;">{emoji} New {title}</h2>
+    <p style="color:#999; font-size:13px; font-family:Arial,Helvetica,sans-serif;">No new qualifying posts since the last check.</p>"""
 
     cards = []
     for m in memes:
@@ -432,7 +483,7 @@ def build_section_html(title, emoji, memes, columns, image_base_url):
         rows.append(f"<tr>{''.join(row_cards)}</tr>")
 
     return f"""
-    <h2 style="color:#222; font-family:Arial,Helvetica,sans-serif;">{emoji} Top {len(memes)} {title}</h2>
+    <h2 style="color:#222; font-family:Arial,Helvetica,sans-serif;">{emoji} {len(memes)} New {title}</h2>
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:900px;">
       {''.join(rows)}
     </table>"""
@@ -447,9 +498,9 @@ def build_html(sections, columns, image_base_url):
     return f"""\
 <html>
   <body style="margin:0; padding:20px; background:#f4f4f4; font-family:Arial,Helvetica,sans-serif;">
-    <h1 style="color:#222;">Today's Top {total} Memes from 9gag</h1>
+    <h1 style="color:#222;">{total} New Memes from 9gag</h1>
     {''.join(body_parts)}
-    <p style="color:#999; font-size:12px; margin-top:20px;">Ranked by upvotes within each category on 9gag's hot feed. Tap any card to view the original post. GIFs animate automatically in Gmail and most mail apps; some desktop clients like Outlook only show the first frame.</p>
+    <p style="color:#999; font-size:12px; margin-top:20px;">Ranked by upvotes within each category on 9gag's hot feed. Posts already sent in a previous run are excluded. Tap any card to view the original post. GIFs animate automatically in Gmail and most mail apps; some desktop clients like Outlook only show the first frame.</p>
   </body>
 </html>"""
 
@@ -463,7 +514,7 @@ def build_plain_text(sections):
     lines = []
     for key, title, emoji in SECTIONS:
         memes = sections[key]
-        lines.append(f"--- Top {len(memes)} {title} ---")
+        lines.append(f"--- {len(memes)} New {title} ---")
         for m in memes:
             tag = " [animated]" if m["has_gif_preview"] else ""
             lines.append(f"#{m['rank']} - {m['title']} ({m['votes']} upvotes){tag} - {m['post_url']}")
@@ -496,14 +547,18 @@ def cmd_generate():
         shutil.rmtree(EMAIL_DIR)
     os.makedirs(EMAIL_DIR)
 
-    print(f"Fetching top {per_section} per section (image/video/gif)...")
-    sections = get_top_memes_by_section(per_section, PREVIEWS_DIR)
+    sent_ids_list, sent_ids_set = load_sent_ids()
+    print(f"Loaded {len(sent_ids_set)} previously-sent post ID(s) from {SENT_IDS_FILE}")
+
+    print(f"Fetching up to {per_section} new per section (image/video/gif)...")
+    sections = get_top_memes_by_section(per_section, PREVIEWS_DIR, sent_ids=sent_ids_set)
 
     total = sum(len(sections[k]) for k, _, _ in SECTIONS)
     if total == 0:
-        print("No memes found.")
+        print("No new memes found since last run.")
         with open(os.path.join(EMAIL_DIR, "meta.json"), "w") as f:
             json.dump({"total": 0}, f)
+        # Nothing new was sent, so the dedup state doesn't need updating.
         return
 
     animated_count = sum(1 for m in all_memes(sections) if m["has_gif_preview"])
@@ -522,7 +577,7 @@ def cmd_generate():
         now = datetime.now()
     timestamp = now.strftime("%b %d, %Y %I:%M %p")
 
-    subject = f"Top {total} memes of the day - {timestamp}"
+    subject = f"{total} new memes - {timestamp}"
     html = build_html(sections, columns, image_base_url)
     text = build_plain_text(sections)
 
@@ -535,7 +590,15 @@ def cmd_generate():
     with open(os.path.join(EMAIL_DIR, "meta.json"), "w") as f:
         json.dump({"total": total}, f)
 
-    print(f"Generated {total} meme(s). Images saved to ./{PREVIEWS_DIR}/, email saved to ./{EMAIL_DIR}/")
+    # Only mark posts as "sent" once they're actually written into the
+    # composed email above — if `send` later fails, they'll be retried
+    # next run rather than silently dropped. (This is a reasonable
+    # tradeoff: worst case is an occasional repeat, not a lost meme.)
+    new_ids = [m["id"] for m in all_memes(sections)]
+    save_sent_ids(sent_ids_list + new_ids)
+    print(f"Updated dedup state: {len(sent_ids_list) + len(new_ids)} tracked ID(s) (cap {SENT_ID_CAP}) -> {SENT_IDS_FILE}")
+
+    print(f"Generated {total} new meme(s). Images saved to ./{PREVIEWS_DIR}/, email saved to ./{EMAIL_DIR}/")
 
 
 def cmd_send():
@@ -555,7 +618,7 @@ def cmd_send():
     with open(os.path.join(EMAIL_DIR, "meta.json")) as f:
         meta = json.load(f)
     if meta.get("total", 0) == 0:
-        print("No memes were found in the generate step — not sending an email.")
+        print("No new memes were found in the generate step — not sending an email.")
         return
 
     with open(os.path.join(EMAIL_DIR, "subject.txt")) as f:
