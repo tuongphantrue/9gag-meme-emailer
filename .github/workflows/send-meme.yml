@@ -53,7 +53,7 @@ jobs:
           git push -q --force origin meme-assets
 
       - name: Wait briefly for raw.githubusercontent.com to serve the new files
-        run: sleep 15
+        run: sleep 30
 
       - name: Send email
         env:
