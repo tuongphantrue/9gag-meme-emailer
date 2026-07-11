@@ -1,43 +1,54 @@
-name: Send Top Meme of the Day
-
+name: Send New Memes
 on:
   schedule:
-    - cron: "0 2 * * *"
+    - cron: "0 * * * *"
   workflow_dispatch: {}
-
 permissions:
   contents: write
-
 jobs:
   send-meme:
     runs-on: ubuntu-latest
+    concurrency:
+      group: send-meme
+      cancel-in-progress: false
     steps:
       - name: Check out repo
         uses: actions/checkout@v6
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-
       - name: Install dependencies
         run: |
           pip install requests Pillow
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg
           ffmpeg -version
-
+      - name: Fetch previous dedup state
+        run: |
+          mkdir -p state
+          if git ls-remote --exit-code --heads origin meme-assets >/dev/null 2>&1; then
+            git fetch --depth 1 origin meme-assets
+            if git show origin/meme-assets:state/sent_ids.json > state/sent_ids.json 2>/dev/null; then
+              echo "Loaded existing dedup state ($(wc -c < state/sent_ids.json) bytes)."
+            else
+              echo "No state/sent_ids.json on meme-assets branch yet, starting fresh."
+              rm -f state/sent_ids.json
+            fi
+          else
+            echo "meme-assets branch doesn't exist yet, starting fresh."
+          fi
       - name: Generate digest (fetch, classify, download, compress)
         env:
-          MEMES_PER_SECTION: "30"
+          MEMES_PER_SECTION: "10"
           GRID_COLUMNS: "3"
           TIMEZONE: "Asia/Ho_Chi_Minh"
+          SENT_IDS_FILE: "state/sent_ids.json"
         run: python 9gag_top_meme_emailer.py generate
-
       - name: Publish images to the meme-assets branch
         run: |
           if [ -z "$(ls -A previews 2>/dev/null)" ]; then
-            echo "No images generated, skipping publish step."
+            echo "No new images generated, skipping publish step."
             exit 0
           fi
           rm -rf /tmp/assets-repo
@@ -48,14 +59,14 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -q -b meme-assets
           cp -r "$GITHUB_WORKSPACE/previews" .
+          mkdir -p state
+          cp "$GITHUB_WORKSPACE/state/sent_ids.json" state/sent_ids.json
           git add -A
           git commit -q -m "Update meme previews - $(date -u +'%Y-%m-%d %H:%M UTC')"
           git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git push -q --force origin meme-assets
-
       - name: Wait for raw.githubusercontent.com to serve the new files
         run: sleep 30
-
       - name: Send email
         env:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
