@@ -5,8 +5,10 @@
 Fetches posts from 9gag's "hot" feed and emails a digest split into three
 sections — Static Images, Videos, and GIFs — each showing its own top
 MEMES_PER_SECTION (default 30) posts ranked by upvote count (90 total by
-default). Thumbnails/animated previews are shown inline in the email body;
-the original file is attached below each card (image, mp4, or gif).
+default). Everything displays inline in the email body — compressed static
+images, and animated GIF previews (converted from the original video) for
+gif/video posts — with no file attachments. Each card links back to the
+original 9gag post.
 
 9gag classifies "Animated" posts as either a GIF or a Video based on
 whether the file has audio (hasAudio flag) — silent = GIF, with sound = Video.
@@ -38,6 +40,7 @@ See README.md / GitHub Actions workflow in this repo for running this daily
 in the cloud without needing your own computer on.
 """
 
+import io
 import os
 import shutil
 import smtplib
@@ -47,14 +50,13 @@ import sys
 import tempfile
 import time
 from datetime import datetime
-from email import encoders
-from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import escape
 
 import requests
+from PIL import Image
 
 # 9gag's unofficial hot-feed API (no auth required for SFW content)
 # Format is /group-posts/group/<GROUP>/type/<SECTION> — "default" is the
@@ -95,6 +97,14 @@ DOWNLOAD_RETRIES = 3
 DOWNLOAD_RETRY_BACKOFF_SECONDS = 1.5
 MIN_VALID_IMAGE_BYTES = 500
 REQUEST_DELAY_SECONDS = 0.3
+
+# Static photo thumbnails are shown inline AND the original is attached
+# separately below — embedding the same full-resolution file twice for up
+# to 90 items is a lot of redundant weight and can make Gmail struggle to
+# render everything. The inline copy is resized/recompressed to stay light;
+# the full-resolution original is still what gets attached as a file.
+INLINE_IMAGE_MAX_WIDTH = 480
+INLINE_IMAGE_JPEG_QUALITY = 78
 
 SECTIONS = [
     ("photo", "Static Images", "\U0001F5BC"),
@@ -154,6 +164,25 @@ def fetch_hot_pages(max_pages=MAX_CANDIDATE_PAGES):
         next_cursor = data.get("nextCursor")
         if not next_cursor:
             break
+
+
+def compress_image_for_inline(image_bytes, max_width=INLINE_IMAGE_MAX_WIDTH, quality=INLINE_IMAGE_JPEG_QUALITY):
+    """Resize + recompress an image for lightweight inline display.
+    Returns (jpeg_bytes, 'jpeg'), or (original_bytes, None) if it fails
+    (caller should fall back to the original bytes/subtype in that case).
+    """
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img = img.convert("RGB")  # flattens transparency, normalizes mode
+        if img.width > max_width:
+            new_height = int(img.height * (max_width / img.width))
+            img = img.resize((max_width, new_height), Image.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=quality, optimize=True)
+        return out.getvalue(), "jpeg"
+    except Exception as e:
+        print(f"  inline compression failed, using original - {e}", file=sys.stderr)
+        return None, None
 
 
 def convert_video_to_gif(video_bytes):
@@ -261,15 +290,17 @@ def collect_candidates(per_section_target):
 
 
 def download_meme(candidate, rank, running_total_bytes):
-    """Download the thumbnail (always) and, for video/gif posts, build an
-    animated GIF preview + attach the full original video (size permitting).
+    """Download and prepare the inline image for this post — a compressed
+    static image for photos, or an animated GIF preview (converted from the
+    video) for video/gif posts. Nothing is kept for a file attachment;
+    everything just displays in the email body.
 
     Returns (meme_dict_or_None, new_running_total_bytes). Returns None for
     the meme if even retries couldn't get a valid thumbnail — the caller
     should skip this candidate rather than embed a broken image.
     """
     try:
-        thumb_bytes = fetch_media_bytes(candidate["thumb_url"], expect="image")
+        raw_thumb_bytes = fetch_media_bytes(candidate["thumb_url"], expect="image")
     except RuntimeError as e:
         print(f"  {candidate['category']} #{rank}: thumbnail failed, skipping - {e}", file=sys.stderr)
         return None, running_total_bytes
@@ -279,50 +310,47 @@ def download_meme(candidate, rank, running_total_bytes):
     safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in candidate["title"])[:50].strip()
     base_name = f"{candidate['category']}_{rank:02d}_{candidate['votes']}_{safe_title or candidate['id']}"
 
+    # Compress the static image before embedding it inline — full-resolution
+    # memes add up fast across up to 90 items.
+    compressed_bytes, compressed_subtype = compress_image_for_inline(raw_thumb_bytes)
+    if compressed_bytes:
+        inline_bytes, inline_subtype = compressed_bytes, compressed_subtype
+    else:
+        inline_bytes, inline_subtype = raw_thumb_bytes, thumb_subtype
+
     meme = {
         "rank": rank,
         "category": candidate["category"],
         "title": candidate["title"],
         "votes": candidate["votes"],
         "post_url": candidate["post_url"],
-        "has_full_video": False,
         "has_gif_preview": False,
-        "thumb_bytes": thumb_bytes,
-        "thumb_subtype": thumb_subtype,
-        "thumb_filename": f"{base_name}.{thumb_ext}",
+        "inline_bytes": inline_bytes,
+        "inline_subtype": inline_subtype,
         "cid": f"{base_name}_cid",
-        "video_bytes": None,
-        "video_filename": None,
     }
 
-    running_total_bytes += len(thumb_bytes)
+    running_total_bytes += len(inline_bytes)
 
-    if candidate["video_url"]:
-        if running_total_bytes < MAX_EMAIL_BYTES:
-            try:
-                video_bytes = fetch_media_bytes(candidate["video_url"], expect="video")
+    if candidate["video_url"] and running_total_bytes < MAX_EMAIL_BYTES:
+        try:
+            video_bytes = fetch_media_bytes(candidate["video_url"], expect="video")
 
-                # Animated GIF preview so it plays natively inline in the email
-                # (mp4 can't autoplay inline in most mail clients).
-                gif_bytes = convert_video_to_gif(video_bytes)
-                if gif_bytes:
-                    meme["thumb_bytes"] = gif_bytes
-                    meme["thumb_subtype"] = "gif"
-                    meme["thumb_filename"] = f"{base_name}.gif"
-                    meme["has_gif_preview"] = True
-                    running_total_bytes += len(gif_bytes) - len(thumb_bytes)
-
-                if running_total_bytes + len(video_bytes) < MAX_EMAIL_BYTES:
-                    meme["has_full_video"] = True
-                    meme["video_bytes"] = video_bytes
-                    meme["video_filename"] = f"{base_name}.mp4"
-                    running_total_bytes += len(video_bytes)
-                else:
-                    print(f"  {candidate['category']} #{rank}: skipping full video attachment (size budget)")
-            except RuntimeError as e:
-                print(f"  {candidate['category']} #{rank}: video download failed, using thumbnail only - {e}", file=sys.stderr)
-        else:
-            print(f"  {candidate['category']} #{rank}: skipping video (size budget)")
+            # Animated GIF preview so it plays natively inline in the email
+            # (mp4 can't autoplay inline in most mail clients). The mp4 itself
+            # is discarded after conversion — nothing is attached.
+            gif_bytes = convert_video_to_gif(video_bytes)
+            if gif_bytes:
+                meme["inline_bytes"] = gif_bytes
+                meme["inline_subtype"] = "gif"
+                meme["has_gif_preview"] = True
+                running_total_bytes += len(gif_bytes) - len(inline_bytes)
+            else:
+                print(f"  {candidate['category']} #{rank}: gif conversion failed, using static thumbnail")
+        except RuntimeError as e:
+            print(f"  {candidate['category']} #{rank}: video download failed, using static thumbnail - {e}", file=sys.stderr)
+    elif candidate["video_url"]:
+        print(f"  {candidate['category']} #{rank}: skipping video->gif conversion (size budget)")
 
     time.sleep(REQUEST_DELAY_SECONDS)
     return meme, running_total_bytes
@@ -375,12 +403,10 @@ def build_section_html(section_key, title, emoji, memes, columns):
             'color:#fff; font-size:12px; padding:2px 7px; border-radius:12px;">&#9654; GIF</span>'
             if m["has_gif_preview"] else ""
         )
-        if m["has_full_video"]:
-            note = '<div style="font-size:11px; color:#4a90d9; margin-top:4px;">Full-length video attached below</div>'
-        elif m["has_gif_preview"]:
-            note = '<div style="font-size:11px; color:#4a90d9; margin-top:4px;">Preview only (original too large to attach)</div>'
-        else:
-            note = ""
+        note = (
+            '<div style="font-size:11px; color:#4a90d9; margin-top:4px;">Animated preview</div>'
+            if m["has_gif_preview"] else ""
+        )
         cards.append(f"""
         <td style="padding:8px; vertical-align:top; width:{100 // columns}%;">
           <a href="{escape(m['post_url'])}" style="text-decoration:none; color:inherit;">
@@ -423,7 +449,7 @@ def build_html(sections, columns):
   <body style="margin:0; padding:20px; background:#f4f4f4; font-family:Arial,Helvetica,sans-serif;">
     <h1 style="color:#222;">Today's Top {total} Memes from 9gag</h1>
     {''.join(body_parts)}
-    <p style="color:#999; font-size:12px; margin-top:20px;">Ranked by upvotes within each category on 9gag's hot feed. Tap any card to view the original post. GIFs animate automatically in most mail apps (Gmail, Apple Mail); some desktop clients like Outlook only show the first frame — the full video is attached below in that case.</p>
+    <p style="color:#999; font-size:12px; margin-top:20px;">Ranked by upvotes within each category on 9gag's hot feed. Tap any card to view the original post. GIFs animate automatically in Gmail and most mail apps; some desktop clients like Outlook only show the first frame.</p>
   </body>
 </html>"""
 
@@ -434,12 +460,7 @@ def build_plain_text(sections):
         memes = sections[key]
         lines.append(f"--- Top {len(memes)} {title} ---")
         for m in memes:
-            if m["has_full_video"]:
-                tag = " [animated, full video attached]"
-            elif m["has_gif_preview"]:
-                tag = " [animated preview only]"
-            else:
-                tag = ""
+            tag = " [animated]" if m["has_gif_preview"] else ""
             lines.append(f"#{m['rank']} - {m['title']} ({m['votes']} upvotes){tag} - {m['post_url']}")
         lines.append("")
     return "\n".join(lines)
@@ -451,37 +472,24 @@ def all_memes(sections):
 
 
 def send_email(subject, sections, columns, sender, app_password, recipient):
-    msg = MIMEMultipart("mixed")
+    # No attachments needed anymore, so multipart/related (HTML + its inline
+    # cid images) can be the top-level container.
+    msg = MIMEMultipart("related")
     msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = recipient
 
-    msg_related = MIMEMultipart("related")
-    msg.attach(msg_related)
-
     msg_alt = MIMEMultipart("alternative")
-    msg_related.attach(msg_alt)
+    msg.attach(msg_alt)
 
     msg_alt.attach(MIMEText(build_plain_text(sections), "plain"))
     msg_alt.attach(MIMEText(build_html(sections, columns), "html"))
 
     for m in all_memes(sections):
-        img = MIMEImage(m["thumb_bytes"], _subtype=m["thumb_subtype"])
+        img = MIMEImage(m["inline_bytes"], _subtype=m["inline_subtype"])
         img.add_header("Content-ID", f"<{m['cid']}>")
-        img.add_header("Content-Disposition", "inline", filename=m["thumb_filename"])
-        msg_related.attach(img)
-
-    for m in all_memes(sections):
-        if m["has_full_video"]:
-            video = MIMEBase("video", "mp4")
-            video.set_payload(m["video_bytes"])
-            encoders.encode_base64(video)
-            video.add_header("Content-Disposition", "attachment", filename=m["video_filename"])
-            msg.attach(video)
-        else:
-            img = MIMEImage(m["thumb_bytes"], _subtype=m["thumb_subtype"])
-            img.add_header("Content-Disposition", "attachment", filename=m["thumb_filename"])
-            msg.attach(img)
+        img.add_header("Content-Disposition", "inline")
+        msg.attach(img)
 
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
