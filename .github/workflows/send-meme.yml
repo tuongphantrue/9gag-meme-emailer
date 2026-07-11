@@ -7,6 +7,9 @@ on:
     - cron: "0 2 * * *"
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab to test
 
+permissions:
+  contents: write   # needed to push generated images to the meme-assets branch
+
 jobs:
   send-meme:
     runs-on: ubuntu-latest
@@ -22,12 +25,39 @@ jobs:
       - name: Install dependencies
         run: pip install requests Pillow
 
-      - name: Run meme emailer
+      - name: Generate digest (fetch, classify, download, compress)
+        env:
+          MEMES_PER_SECTION: "30"         # top N per section (static image / video / gif)
+          GRID_COLUMNS: "3"               # cards per row in the HTML digest
+          TIMEZONE: "Asia/Ho_Chi_Minh"    # used for the date/time shown in the subject line
+        run: python 9gag_top_meme_emailer.py generate
+
+      - name: Publish images to the meme-assets branch
+        run: |
+          if [ -z "$(ls -A previews 2>/dev/null)" ]; then
+            echo "No images generated, skipping publish step."
+            exit 0
+          fi
+
+          rm -rf /tmp/assets-repo
+          mkdir /tmp/assets-repo
+          cd /tmp/assets-repo
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -q -b meme-assets
+          cp -r "$GITHUB_WORKSPACE/previews" .
+          git add -A
+          git commit -q -m "Update meme previews - $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push -q --force origin meme-assets
+
+      - name: Wait briefly for raw.githubusercontent.com to serve the new files
+        run: sleep 15
+
+      - name: Send email
         env:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           MEME_RECIPIENT: ${{ secrets.MEME_RECIPIENT }}
-          MEMES_PER_SECTION: "30"         # top N per section (static image / video / gif)
-          GRID_COLUMNS: "3"               # cards per row in the HTML digest
-          TIMEZONE: "Asia/Ho_Chi_Minh"    # used for the date/time shown in the subject line
-        run: python 9gag_top_meme_emailer.py
+        run: python 9gag_top_meme_emailer.py send
