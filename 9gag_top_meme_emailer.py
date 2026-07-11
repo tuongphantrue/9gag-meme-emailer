@@ -454,6 +454,11 @@ def build_html(sections, columns, image_base_url):
 </html>"""
 
 
+def all_memes(sections):
+    for key, _, _ in SECTIONS:
+        yield from sections[key]
+
+
 def build_plain_text(sections):
     lines = []
     for key, title, emoji in SECTIONS:
@@ -481,6 +486,9 @@ def cmd_generate():
     per_section = int(os.environ.get("MEMES_PER_SECTION", "30"))
     columns = int(os.environ.get("GRID_COLUMNS", "3"))
 
+    print(f"ffmpeg available: {FFMPEG_AVAILABLE}"
+          + ("" if FFMPEG_AVAILABLE else " -- video/gif posts will fall back to a static thumbnail!"))
+
     if os.path.exists(PREVIEWS_DIR):
         shutil.rmtree(PREVIEWS_DIR)
     os.makedirs(PREVIEWS_DIR)
@@ -497,6 +505,12 @@ def cmd_generate():
         with open(os.path.join(EMAIL_DIR, "meta.json"), "w") as f:
             json.dump({"total": 0}, f)
         return
+
+    animated_count = sum(1 for m in all_memes(sections) if m["has_gif_preview"])
+    animatable_count = len(sections["video"]) + len(sections["gif"])
+    print(f"Animated previews: {animated_count}/{animatable_count} video+gif posts converted successfully.")
+    if animatable_count and animated_count < animatable_count:
+        print("Some video/gif posts fell back to a static thumbnail — check ffmpeg errors above.", file=sys.stderr)
 
     image_base_url = resolve_image_base_url()
 
