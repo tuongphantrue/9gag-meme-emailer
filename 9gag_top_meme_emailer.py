@@ -1,38 +1,55 @@
 #!/usr/bin/env python3
 """
-9gag Top Memes of the Day -> Email (HTML digest, 3 sections)
+9gag Top Memes of the Day -> Email (HTML digest, 3 sections, hosted images)
 
 Fetches posts from 9gag's "hot" feed and emails a digest split into three
 sections — Static Images, Videos, and GIFs — each showing its own top
 MEMES_PER_SECTION (default 30) posts ranked by upvote count (90 total by
-default). Everything displays inline in the email body — compressed static
-images, and animated GIF previews (converted from the original video) for
-gif/video posts — with no file attachments. Each card links back to the
-original 9gag post.
+default).
 
-9gag classifies "Animated" posts as either a GIF or a Video based on
-whether the file has audio (hasAudio flag) — silent = GIF, with sound = Video.
+Images are hosted on GitHub (pushed to a public "meme-assets" branch of this
+repo) and referenced by normal https:// URLs in the email, rather than
+embedded as raw inline CID attachments. Gmail (and most webmail clients) is
+known to be unreliable when a single email embeds a large number of raw
+inline CID images sent via SMTP — some render, some silently don't, and it's
+not predictable which. Hosting externally and linking by URL is the standard
+way bulk-image emails (newsletters, digests) solve this.
+
+This script runs in two phases so the workflow can push the images to GitHub
+*between* them (see the accompanying GitHub Actions workflow):
+
+    python 9gag_top_meme_emailer.py generate
+        -> downloads/classifies/compresses media, saves it under ./previews/,
+           and writes the composed email (subject/html/text) under ./email/
+
+    python 9gag_top_meme_emailer.py send
+        -> reads ./email/* and sends it via Gmail SMTP
 
 SETUP
 -----
-1. Install dependency:
-       pip install requests
+1. Install dependencies:
+       pip install requests Pillow
 
 2. Create a Gmail "App Password" (regular Gmail passwords won't work with SMTP):
        - Go to https://myaccount.google.com/apppasswords
        - You need 2-Step Verification turned on first.
        - Create an app password for "Mail" and copy the 16-character code.
 
-3. Set these as environment variables (recommended, keeps secrets out of the file):
+3. Make this repo PUBLIC (Settings -> General -> Danger Zone -> Change
+   visibility). This only exposes the meme image files pushed to the
+   "meme-assets" branch — your Gmail credentials stay protected as encrypted
+   repo secrets regardless of repo visibility.
+
+4. Set these as environment variables:
        export GMAIL_ADDRESS="youraddress@gmail.com"
        export GMAIL_APP_PASSWORD="16-char-app-password"
        export MEME_RECIPIENT="where-to-send@example.com"
-       export MEMES_PER_SECTION="30"       # optional, top N per section (image/video/gif)
-       export GRID_COLUMNS="3"             # optional, cards per row in the email
-       export TIMEZONE="Asia/Ho_Chi_Minh"  # optional, used for the subject line's date/time
-
-4. Run it:
-       python 9gag_top_meme_emailer.py
+       export MEMES_PER_SECTION="30"       # optional, top N per section
+       export GRID_COLUMNS="3"             # optional, cards per row
+       export TIMEZONE="Asia/Ho_Chi_Minh"  # optional, for the subject line
+       export GITHUB_REPOSITORY="yourname/9gag-meme-emailer"  # owner/repo,
+                                            # auto-set already inside GitHub Actions
+       export IMAGE_BRANCH="meme-assets"   # optional, branch images are hosted on
 
 SCHEDULING
 ----------
@@ -41,6 +58,7 @@ in the cloud without needing your own computer on.
 """
 
 import io
+import json
 import os
 import shutil
 import smtplib
@@ -50,7 +68,6 @@ import sys
 import tempfile
 import time
 from datetime import datetime
-from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from html import escape
@@ -72,45 +89,37 @@ HEADERS = {
 
 # How many feed pages to scan when building the candidate pool. We need
 # enough pages to find MEMES_PER_SECTION posts in each of the 3 categories,
-# and videos/gifs are much rarer than photos in the hot feed, so this needs
-# to be fairly generous. Each page is ~10 posts.
+# and videos/gifs are much rarer than photos in the hot feed. Each page is
+# ~10 posts.
 MAX_CANDIDATE_PAGES = 60
-
-# Gmail's hard cap is ~25MB per message. Leave headroom for MIME/base64
-# overhead (base64 inflates size by ~33%) and stop adding full videos once
-# we're getting close, falling back to preview/thumbnail-only for the rest.
-MAX_EMAIL_BYTES = 20 * 1024 * 1024
-
-# Tuning for the inline animated-GIF preview generated from each video/gif.
-# Keeps file size reasonable while still looking good in an email.
-GIF_MAX_SECONDS = 6
-GIF_WIDTH = 380
-GIF_FPS = 10
-FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
 
 # Media download reliability tuning. 9gag's CDN occasionally rate-limits or
 # hotlink-blocks a fraction of rapid-fire requests, returning a small error
-# response with a 200 status instead of the real file — this shows up as a
-# broken image in the email. We retry those and add a small delay between
-# requests to reduce how often it happens in the first place.
+# response with a 200 status instead of the real file.
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_RETRY_BACKOFF_SECONDS = 1.5
 MIN_VALID_IMAGE_BYTES = 500
 REQUEST_DELAY_SECONDS = 0.3
 
-# Static photo thumbnails are shown inline AND the original is attached
-# separately below — embedding the same full-resolution file twice for up
-# to 90 items is a lot of redundant weight and can make Gmail struggle to
-# render everything. The inline copy is resized/recompressed to stay light;
-# the full-resolution original is still what gets attached as a file.
-INLINE_IMAGE_MAX_WIDTH = 480
-INLINE_IMAGE_JPEG_QUALITY = 78
+# Static photo images are resized/recompressed before hosting — full-res
+# originals aren't necessary for a small digest card.
+IMAGE_MAX_WIDTH = 640
+IMAGE_JPEG_QUALITY = 80
+
+# Tuning for the animated-GIF preview generated from each video/gif post.
+GIF_MAX_SECONDS = 6
+GIF_WIDTH = 380
+GIF_FPS = 10
+FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
 
 SECTIONS = [
     ("photo", "Static Images", "\U0001F5BC"),
     ("video", "Videos", "\U0001F3A5"),
     ("gif", "GIFs", "\U0001F39E"),
 ]
+
+PREVIEWS_DIR = "previews"
+EMAIL_DIR = "email"
 
 
 def fetch_media_bytes(url, expect="image", retries=DOWNLOAD_RETRIES):
@@ -166,29 +175,27 @@ def fetch_hot_pages(max_pages=MAX_CANDIDATE_PAGES):
             break
 
 
-def compress_image_for_inline(image_bytes, max_width=INLINE_IMAGE_MAX_WIDTH, quality=INLINE_IMAGE_JPEG_QUALITY):
-    """Resize + recompress an image for lightweight inline display.
-    Returns (jpeg_bytes, 'jpeg'), or (original_bytes, None) if it fails
-    (caller should fall back to the original bytes/subtype in that case).
+def compress_image(image_bytes, max_width=IMAGE_MAX_WIDTH, quality=IMAGE_JPEG_QUALITY):
+    """Resize + recompress an image for lightweight hosting.
+    Returns (jpeg_bytes, 'jpg'), or (original_bytes, None) if it fails.
     """
     try:
         img = Image.open(io.BytesIO(image_bytes))
-        img = img.convert("RGB")  # flattens transparency, normalizes mode
+        img = img.convert("RGB")
         if img.width > max_width:
             new_height = int(img.height * (max_width / img.width))
             img = img.resize((max_width, new_height), Image.LANCZOS)
         out = io.BytesIO()
         img.save(out, format="JPEG", quality=quality, optimize=True)
-        return out.getvalue(), "jpeg"
+        return out.getvalue(), "jpg"
     except Exception as e:
-        print(f"  inline compression failed, using original - {e}", file=sys.stderr)
+        print(f"  image compression failed, using original - {e}", file=sys.stderr)
         return None, None
 
 
 def convert_video_to_gif(video_bytes):
     """Convert mp4 bytes to a compact animated GIF using ffmpeg's two-pass
-    palette method (much smaller/better quality than a naive conversion).
-    Returns gif bytes, or None if ffmpeg isn't available or conversion fails.
+    palette method. Returns gif bytes, or None if unavailable/failed.
     """
     if not FFMPEG_AVAILABLE:
         return None
@@ -289,87 +296,67 @@ def collect_candidates(per_section_target):
     return buckets
 
 
-def download_meme(candidate, rank, running_total_bytes):
-    """Download and prepare the inline image for this post — a compressed
-    static image for photos, or an animated GIF preview (converted from the
-    video) for video/gif posts. Nothing is kept for a file attachment;
-    everything just displays in the email body.
+def download_meme(candidate, rank, output_dir):
+    """Download the media for this post, save it under output_dir, and
+    return a meme dict with a `filename` (relative to output_dir) for the
+    final hosted file — a compressed static image for photos, or an
+    animated GIF preview (converted from the video) for video/gif posts.
 
-    Returns (meme_dict_or_None, new_running_total_bytes). Returns None for
-    the meme if even retries couldn't get a valid thumbnail — the caller
-    should skip this candidate rather than embed a broken image.
+    Returns None if even retries couldn't get a valid file for this post.
     """
     try:
-        raw_thumb_bytes = fetch_media_bytes(candidate["thumb_url"], expect="image")
+        raw_bytes = fetch_media_bytes(candidate["thumb_url"], expect="image")
     except RuntimeError as e:
         print(f"  {candidate['category']} #{rank}: thumbnail failed, skipping - {e}", file=sys.stderr)
-        return None, running_total_bytes
+        return None
 
-    thumb_ext = candidate["thumb_url"].split(".")[-1].split("?")[0]
-    thumb_subtype = "jpeg" if thumb_ext == "jpg" else thumb_ext
     safe_title = "".join(c if c.isalnum() or c in " -_" else "" for c in candidate["title"])[:50].strip()
     base_name = f"{candidate['category']}_{rank:02d}_{candidate['votes']}_{safe_title or candidate['id']}"
 
-    # Compress the static image before embedding it inline — full-resolution
-    # memes add up fast across up to 90 items.
-    compressed_bytes, compressed_subtype = compress_image_for_inline(raw_thumb_bytes)
-    if compressed_bytes:
-        inline_bytes, inline_subtype = compressed_bytes, compressed_subtype
-    else:
-        inline_bytes, inline_subtype = raw_thumb_bytes, thumb_subtype
+    file_bytes, ext = compress_image(raw_bytes)
+    if file_bytes is None:
+        file_bytes, ext = raw_bytes, "jpg"
 
-    meme = {
+    has_gif_preview = False
+
+    if candidate["video_url"]:
+        try:
+            video_bytes = fetch_media_bytes(candidate["video_url"], expect="video")
+            gif_bytes = convert_video_to_gif(video_bytes)
+            if gif_bytes:
+                file_bytes, ext = gif_bytes, "gif"
+                has_gif_preview = True
+            else:
+                print(f"  {candidate['category']} #{rank}: gif conversion failed, using static image")
+        except RuntimeError as e:
+            print(f"  {candidate['category']} #{rank}: video download failed, using static image - {e}", file=sys.stderr)
+
+    filename = f"{base_name}.{ext}"
+    with open(os.path.join(output_dir, filename), "wb") as f:
+        f.write(file_bytes)
+
+    time.sleep(REQUEST_DELAY_SECONDS)
+
+    return {
         "rank": rank,
         "category": candidate["category"],
         "title": candidate["title"],
         "votes": candidate["votes"],
         "post_url": candidate["post_url"],
-        "has_gif_preview": False,
-        "inline_bytes": inline_bytes,
-        "inline_subtype": inline_subtype,
-        "cid": f"{base_name}_cid",
+        "has_gif_preview": has_gif_preview,
+        "filename": filename,
     }
 
-    running_total_bytes += len(inline_bytes)
 
-    if candidate["video_url"] and running_total_bytes < MAX_EMAIL_BYTES:
-        try:
-            video_bytes = fetch_media_bytes(candidate["video_url"], expect="video")
-
-            # Animated GIF preview so it plays natively inline in the email
-            # (mp4 can't autoplay inline in most mail clients). The mp4 itself
-            # is discarded after conversion — nothing is attached.
-            gif_bytes = convert_video_to_gif(video_bytes)
-            if gif_bytes:
-                meme["inline_bytes"] = gif_bytes
-                meme["inline_subtype"] = "gif"
-                meme["has_gif_preview"] = True
-                running_total_bytes += len(gif_bytes) - len(inline_bytes)
-            else:
-                print(f"  {candidate['category']} #{rank}: gif conversion failed, using static thumbnail")
-        except RuntimeError as e:
-            print(f"  {candidate['category']} #{rank}: video download failed, using static thumbnail - {e}", file=sys.stderr)
-    elif candidate["video_url"]:
-        print(f"  {candidate['category']} #{rank}: skipping video->gif conversion (size budget)")
-
-    time.sleep(REQUEST_DELAY_SECONDS)
-    return meme, running_total_bytes
-
-
-def get_top_memes_by_section(per_section):
+def get_top_memes_by_section(per_section, output_dir):
     """Return {'photo': [...], 'video': [...], 'gif': [...]}, each the top
-    `per_section` posts of that category ranked by upvotes, media downloaded.
-
-    Processing order is photo -> gif -> video, so if the size budget runs
-    tight, it's the heaviest items (full videos) that degrade first, not
-    the cheap static images. Candidates that fail to download validly (even
-    after retries) are skipped in favor of the next-highest-voted one, so
-    a section still fills up to `per_section` whenever enough candidates exist.
+    `per_section` posts of that category ranked by upvotes, media saved to
+    output_dir. Candidates that fail to download validly (even after
+    retries) are skipped in favor of the next-highest-voted one.
     """
     buckets = collect_candidates(per_section)
 
     result = {}
-    running_total_bytes = 0
     for category in ("photo", "gif", "video"):
         candidates = sorted(buckets[category], key=lambda c: c["votes"], reverse=True)
         memes = []
@@ -377,9 +364,9 @@ def get_top_memes_by_section(per_section):
         for candidate in candidates:
             if len(memes) >= per_section:
                 break
-            meme, running_total_bytes = download_meme(candidate, rank, running_total_bytes)
+            meme = download_meme(candidate, rank, output_dir)
             if meme is None:
-                continue  # thumbnail failed even after retries — try the next candidate
+                continue
             memes.append(meme)
             tag = "gif preview" if meme["has_gif_preview"] else "image"
             print(f"  {category} #{rank} [{tag}]: {meme['title']} ({meme['votes']} upvotes)")
@@ -389,7 +376,7 @@ def get_top_memes_by_section(per_section):
     return result
 
 
-def build_section_html(section_key, title, emoji, memes, columns):
+def build_section_html(title, emoji, memes, columns, image_base_url):
     if not memes:
         return f"""
     <h2 style="color:#222; font-family:Arial,Helvetica,sans-serif;">{emoji} Top {title}</h2>
@@ -398,6 +385,7 @@ def build_section_html(section_key, title, emoji, memes, columns):
     cards = []
     for m in memes:
         title_esc = escape(m["title"])
+        img_url = f"{image_base_url}/{m['filename']}"
         play_badge = (
             '<span style="position:absolute; top:6px; right:6px; background:rgba(0,0,0,0.65); '
             'color:#fff; font-size:12px; padding:2px 7px; border-radius:12px;">&#9654; GIF</span>'
@@ -412,7 +400,7 @@ def build_section_html(section_key, title, emoji, memes, columns):
           <a href="{escape(m['post_url'])}" style="text-decoration:none; color:inherit;">
             <div style="border:1px solid #e0e0e0; border-radius:10px; overflow:hidden; font-family:Arial,Helvetica,sans-serif;">
               <div style="position:relative;">
-                <img src="cid:{m['cid']}" alt="{title_esc}" style="display:block; width:100%; height:auto; max-height:500px; object-fit:contain; background:#f5f5f5;">
+                <img src="{escape(img_url)}" alt="{title_esc}" style="display:block; width:100%; height:auto; max-height:500px; object-fit:contain; background:#f5f5f5;">
                 <span style="position:absolute; top:6px; left:6px; background:rgba(0,0,0,0.65); color:#fff; font-size:12px; padding:2px 7px; border-radius:12px;">#{m['rank']}</span>
                 {play_badge}
               </div>
@@ -438,9 +426,9 @@ def build_section_html(section_key, title, emoji, memes, columns):
     </table>"""
 
 
-def build_html(sections, columns):
+def build_html(sections, columns, image_base_url):
     body_parts = [
-        build_section_html(key, title, emoji, sections[key], columns)
+        build_section_html(title, emoji, sections[key], columns, image_base_url)
         for key, title, emoji in SECTIONS
     ]
     total = sum(len(sections[k]) for k, _, _ in SECTIONS)
@@ -466,43 +454,68 @@ def build_plain_text(sections):
     return "\n".join(lines)
 
 
-def all_memes(sections):
-    for key, _, _ in SECTIONS:
-        yield from sections[key]
+def resolve_image_base_url():
+    branch = os.environ.get("IMAGE_BRANCH", "meme-assets")
+    repo = os.environ.get("GITHUB_REPOSITORY")  # auto-set inside GitHub Actions as "owner/repo"
+    if not repo:
+        raise RuntimeError(
+            "GITHUB_REPOSITORY is not set. Set it manually as 'owner/repo' when running "
+            "outside GitHub Actions, or rely on the workflow which sets it automatically."
+        )
+    return f"https://raw.githubusercontent.com/{repo}/{branch}/{PREVIEWS_DIR}"
 
 
-def send_email(subject, sections, columns, sender, app_password, recipient):
-    # No attachments needed anymore, so multipart/related (HTML + its inline
-    # cid images) can be the top-level container.
-    msg = MIMEMultipart("related")
-    msg["Subject"] = subject
-    msg["From"] = sender
-    msg["To"] = recipient
+def cmd_generate():
+    per_section = int(os.environ.get("MEMES_PER_SECTION", "30"))
+    columns = int(os.environ.get("GRID_COLUMNS", "3"))
 
-    msg_alt = MIMEMultipart("alternative")
-    msg.attach(msg_alt)
+    if os.path.exists(PREVIEWS_DIR):
+        shutil.rmtree(PREVIEWS_DIR)
+    os.makedirs(PREVIEWS_DIR)
+    if os.path.exists(EMAIL_DIR):
+        shutil.rmtree(EMAIL_DIR)
+    os.makedirs(EMAIL_DIR)
 
-    msg_alt.attach(MIMEText(build_plain_text(sections), "plain"))
-    msg_alt.attach(MIMEText(build_html(sections, columns), "html"))
+    print(f"Fetching top {per_section} per section (image/video/gif)...")
+    sections = get_top_memes_by_section(per_section, PREVIEWS_DIR)
 
-    for m in all_memes(sections):
-        img = MIMEImage(m["inline_bytes"], _subtype=m["inline_subtype"])
-        img.add_header("Content-ID", f"<{m['cid']}>")
-        img.add_header("Content-Disposition", "inline")
-        msg.attach(img)
+    total = sum(len(sections[k]) for k, _, _ in SECTIONS)
+    if total == 0:
+        print("No memes found.")
+        with open(os.path.join(EMAIL_DIR, "meta.json"), "w") as f:
+            json.dump({"total": 0}, f)
+        return
 
-    context = ssl.create_default_context()
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
-        server.login(sender, app_password)
-        server.send_message(msg)
+    image_base_url = resolve_image_base_url()
+
+    timezone_name = os.environ.get("TIMEZONE", "Asia/Ho_Chi_Minh")
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo(timezone_name))
+    except Exception:
+        now = datetime.now()
+    timestamp = now.strftime("%b %d, %Y %I:%M %p")
+
+    subject = f"Top {total} memes of the day - {timestamp}"
+    html = build_html(sections, columns, image_base_url)
+    text = build_plain_text(sections)
+
+    with open(os.path.join(EMAIL_DIR, "subject.txt"), "w") as f:
+        f.write(subject)
+    with open(os.path.join(EMAIL_DIR, "body.html"), "w") as f:
+        f.write(html)
+    with open(os.path.join(EMAIL_DIR, "body.txt"), "w") as f:
+        f.write(text)
+    with open(os.path.join(EMAIL_DIR, "meta.json"), "w") as f:
+        json.dump({"total": total}, f)
+
+    print(f"Generated {total} meme(s). Images saved to ./{PREVIEWS_DIR}/, email saved to ./{EMAIL_DIR}/")
 
 
-def main():
+def cmd_send():
     sender = os.environ.get("GMAIL_ADDRESS")
     app_password = os.environ.get("GMAIL_APP_PASSWORD")
     recipient = os.environ.get("MEME_RECIPIENT")
-    per_section = int(os.environ.get("MEMES_PER_SECTION", "30"))
-    columns = int(os.environ.get("GRID_COLUMNS", "3"))
 
     missing = [name for name, val in [
         ("GMAIL_ADDRESS", sender),
@@ -513,33 +526,43 @@ def main():
         print(f"Missing required environment variables: {', '.join(missing)}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Fetching top {per_section} per section (image/video/gif)...")
-    sections = get_top_memes_by_section(per_section)
-
-    total = sum(len(sections[k]) for k, _, _ in SECTIONS)
-    if total == 0:
-        print("No memes found — not sending an email.")
+    with open(os.path.join(EMAIL_DIR, "meta.json")) as f:
+        meta = json.load(f)
+    if meta.get("total", 0) == 0:
+        print("No memes were found in the generate step — not sending an email.")
         return
 
-    print(f"Found {total} meme(s) total. Emailing to {recipient}...")
+    with open(os.path.join(EMAIL_DIR, "subject.txt")) as f:
+        subject = f.read()
+    with open(os.path.join(EMAIL_DIR, "body.html")) as f:
+        html = f.read()
+    with open(os.path.join(EMAIL_DIR, "body.txt")) as f:
+        text = f.read()
 
-    timezone_name = os.environ.get("TIMEZONE", "Asia/Ho_Chi_Minh")
-    try:
-        from zoneinfo import ZoneInfo
-        now = datetime.now(ZoneInfo(timezone_name))
-    except Exception:
-        now = datetime.now()
-    timestamp = now.strftime("%b %d, %Y %I:%M %p")
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg.attach(MIMEText(text, "plain"))
+    msg.attach(MIMEText(html, "html"))
 
-    send_email(
-        subject=f"Top {total} memes of the day - {timestamp}",
-        sections=sections,
-        columns=columns,
-        sender=sender,
-        app_password=app_password,
-        recipient=recipient,
-    )
-    print("Sent!")
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+        server.login(sender, app_password)
+        server.send_message(msg)
+
+    print(f"Sent to {recipient}!")
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ("generate", "send"):
+        print("Usage: python 9gag_top_meme_emailer.py [generate|send]", file=sys.stderr)
+        sys.exit(1)
+
+    if sys.argv[1] == "generate":
+        cmd_generate()
+    else:
+        cmd_send()
 
 
 if __name__ == "__main__":
