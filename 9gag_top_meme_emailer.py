@@ -44,8 +44,8 @@ SETUP
        export GMAIL_ADDRESS="youraddress@gmail.com"
        export GMAIL_APP_PASSWORD="16-char-app-password"
        export MEME_RECIPIENT="where-to-send@example.com"
-       export MEMES_PER_SECTION="30"       # optional, top N per section
-       export GRID_COLUMNS="3"             # optional, cards per row
+       export MEMES_PER_SECTION="90"       # optional, top N per section
+       export GRID_COLUMNS="1"             # optional, cards per row
        export TIMEZONE="Asia/Ho_Chi_Minh"  # optional, for the subject line
        export GITHUB_REPOSITORY="yourname/9gag-meme-emailer"  # owner/repo,
                                             # auto-set already inside GitHub Actions
@@ -534,7 +534,7 @@ def resolve_image_base_url():
 
 
 def cmd_generate():
-    per_section = int(os.environ.get("MEMES_PER_SECTION", "30"))
+    per_section = int(os.environ.get("MEMES_PER_SECTION", "90"))
     columns = int(os.environ.get("GRID_COLUMNS", "3"))
 
     print(f"ffmpeg available: {FFMPEG_AVAILABLE}"
