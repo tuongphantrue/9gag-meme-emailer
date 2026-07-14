@@ -1,7 +1,7 @@
 name: Send New Memes
 on:
   schedule:
-    - cron: "40 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch: {}
 permissions:
   contents: write
@@ -40,7 +40,7 @@ jobs:
           fi
       - name: Generate digest (fetch, classify, download, compress)
         env:
-          MEMES_PER_SECTION: "10"
+          MEMES_PER_SECTION: "50"
           GRID_COLUMNS: "3"
           TIMEZONE: "Asia/Ho_Chi_Minh"
           SENT_IDS_FILE: "state/sent_ids.json"
